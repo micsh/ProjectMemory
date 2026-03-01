@@ -2,6 +2,7 @@ namespace ProjectMemory
 
 open System
 open System.ComponentModel
+open System.IO
 open System.Runtime.InteropServices
 open ModelContextProtocol.Server
 
@@ -14,10 +15,16 @@ type KnowledgeTools(db: ProjectMemoryDb) =
         (
             [<Optional; DefaultParameterValue(null: string)>]
             [<Description("File path or glob to filter by scope. Omit for all knowledge.")>]
-            scope: string
+            scope: string,
+            [<Optional; DefaultParameterValue(null: string)>]
+            [<Description("Session identifier for tracking which items were injected. Auto-generated if omitted.")>]
+            sessionId: string
         ) =
         let scope = if String.IsNullOrEmpty(scope) then None else Some scope
-        db.GetContext(scope, 20)
+        let sessionId =
+            if String.IsNullOrEmpty(sessionId) then Guid.NewGuid().ToString("N").Substring(0, 12)
+            else sessionId
+        db.GetContext(scope, 20, sessionId)
 
     [<McpServerTool(Name = "project_query")>]
     [<Description("Run read-only SQL against the project memory database. Tables: knowledge(id,category,scope,content,confidence,source,session_count), lessons(id,lesson_text,trigger,scope,recurrence,confidence,status)")>]
@@ -117,14 +124,27 @@ type KnowledgeTools(db: ProjectMemoryDb) =
             useful: bool
         ) =
         try
-            let affected =
-                db.Execute(
-                    "UPDATE session_injections SET was_useful = @useful WHERE session_id = @sid AND item_id = @iid",
-                    [ ("@useful", box (if useful then 1 else 0))
-                      ("@sid", box sessionId)
-                      ("@iid", box itemId) ]
-                )
-            if affected > 0 then $"Feedback recorded for {itemId}"
-            else $"No injection record found for session={sessionId}, item={itemId}"
+            db.MarkUseful(sessionId, itemId, useful)
+        with ex ->
+            $"Error: {ex.Message}"
+
+    [<McpServerTool(Name = "consolidate")>]
+    [<Description("Consolidate lessons: merge near-duplicates, promote high-recurrence lessons to knowledge, prune stale entries. Run periodically or after bulk lesson recording.")>]
+    member _.Consolidate() =
+        try
+            db.Consolidate()
+        with ex ->
+            $"Error: {ex.Message}"
+
+    [<McpServerTool(Name = "graduate")>]
+    [<Description("Graduate high-confidence knowledge to copilot-instructions.md. Appends entries with confidence >= 0.9 and session_count >= 10 to an auto-managed section.")>]
+    member _.Graduate() =
+        try
+            let instructionsPath =
+                match Environment.GetEnvironmentVariable("PROJECT_MEMORY_INSTRUCTIONS_FILE") with
+                | null | "" ->
+                    Path.Combine(Directory.GetCurrentDirectory(), ".github", "copilot-instructions.md")
+                | path -> path
+            db.Graduate(instructionsPath)
         with ex ->
             $"Error: {ex.Message}"

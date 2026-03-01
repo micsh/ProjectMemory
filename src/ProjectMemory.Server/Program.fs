@@ -16,6 +16,7 @@ let main args =
         | path -> path
 
     let builder = Host.CreateApplicationBuilder(args)
+    builder.Logging.ClearProviders() |> ignore
     builder.Logging.SetMinimumLevel(LogLevel.Warning) |> ignore
     builder.Logging.AddConsole(fun o -> o.LogToStandardErrorThreshold <- LogLevel.Trace) |> ignore
     builder.Services.AddSingleton<ProjectMemoryDb>(fun _ -> ProjectMemoryDb(dbPath)) |> ignore

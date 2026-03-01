@@ -6,6 +6,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Include="Schema.fs" />
+    <Compile Include="Similarity.fs" />
+    <Compile Include="Formatting.fs" />
+    <Compile Include="InstructionsFile.fs" />
     <Compile Include="Database.fs" />
     <Compile Include="Tools.fs" />
     <Compile Include="Program.fs" />

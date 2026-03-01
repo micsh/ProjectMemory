@@ -136,3 +136,155 @@ type DatabaseTests() =
         let result = db.Query("SELECT COUNT(*) as cnt FROM knowledge")
         Assert.True((result.Rows.[0].["cnt"] :?> int64) >= 1L)
 
+    [<Fact>]
+    member _.``Fuzzy dedup merges similar lessons``() =
+        let id1 = db.RecordLesson("When deploying to staging, always run integration tests first", "user_correction", null, "*", 0.7, null)
+        let id2 = db.RecordLesson("When deploying to staging, always run the integration tests first", "discovery", null, "*", 0.3, null)
+        Assert.Equal(id1, id2)
+        let result = db.Query("SELECT recurrence FROM lessons WHERE id = @id", [ ("@id", box (int64 id1)) ])
+        Assert.Equal(2L, result.Rows.[0].["recurrence"] :?> int64)
+
+    [<Fact>]
+    member _.``Fuzzy dedup does not merge dissimilar lessons``() =
+        let id1 = db.RecordLesson("Always check null references before accessing properties", "build_failure", null, "*", 0.3, null)
+        let id2 = db.RecordLesson("Use async/await for all database calls", "discovery", null, "*", 0.3, null)
+        Assert.NotEqual(id1, id2)
+
+    [<Fact>]
+    member _.``JaccardSimilarity returns 1 for identical strings``() =
+        let sim = Similarity.jaccard "hello world" "hello world"
+        Assert.Equal(1.0, sim)
+
+    [<Fact>]
+    member _.``JaccardSimilarity returns 0 for completely different strings``() =
+        let sim = Similarity.jaccard "alpha beta gamma" "delta epsilon zeta"
+        Assert.Equal(0.0, sim)
+
+    [<Fact>]
+    member _.``GetContext filters lessons by scope``() =
+        db.RecordLesson("Global lesson applies everywhere", "discovery", null, "*", 0.5, null) |> ignore
+        db.RecordLesson("Auth lesson for auth files", "user_correction", null, "src/Auth/*", 0.7, null) |> ignore
+        db.RecordLesson("UI lesson for UI files", "user_correction", null, "src/UI/*", 0.7, null) |> ignore
+        let context = db.GetContext(Some "src/Auth/Login.fs", 20)
+        Assert.Contains("Global lesson applies everywhere", context)
+        Assert.Contains("Auth lesson for auth files", context)
+        Assert.DoesNotContain("UI lesson for UI files", context)
+
+    [<Fact>]
+    member _.``Consolidate merges near-duplicate lessons``() =
+        // Insert directly to bypass RecordLesson's 70% fuzzy dedup
+        let now = DateTime.UtcNow.ToString("o")
+        db.Execute(
+            "INSERT INTO lessons (lesson_text, trigger, scope, recurrence, confidence, status, created_at, updated_at) VALUES (@t, 'discovery', '*', 2, 0.3, 'active', @now, @now)",
+            [ ("@t", box "Always run tests before pushing code to the remote repository"); ("@now", box now) ]
+        ) |> ignore
+        db.Execute(
+            "INSERT INTO lessons (lesson_text, trigger, scope, recurrence, confidence, status, created_at, updated_at) VALUES (@t, 'discovery', '*', 1, 0.3, 'active', @now, @now)",
+            [ ("@t", box "Always run the tests before pushing code to the remote repo"); ("@now", box now) ]
+        ) |> ignore
+        let before = db.Query("SELECT COUNT(*) as cnt FROM lessons WHERE status = 'active'")
+        let result = db.Consolidate()
+        let after = db.Query("SELECT COUNT(*) as cnt FROM lessons WHERE status = 'active'")
+        Assert.True((after.Rows.[0].["cnt"] :?> int64) < (before.Rows.[0].["cnt"] :?> int64))
+        Assert.Contains("Merged", result)
+
+    [<Fact>]
+    member _.``Consolidate promotes high-recurrence lessons to knowledge``() =
+        let id = db.RecordLesson("Use dependency injection everywhere", "user_correction", null, "*", 0.7, null)
+        // Bump recurrence to 5
+        for _ in 1..4 do
+            db.RecordLesson("Use dependency injection everywhere", "user_correction", null, "*", 0.7, null) |> ignore
+        let lesson = db.Query("SELECT recurrence, confidence FROM lessons WHERE id = @id", [ ("@id", box (int64 id)) ])
+        Assert.True((lesson.Rows.[0].["recurrence"] :?> int64) >= 5L)
+        db.Consolidate() |> ignore
+        let promoted = db.Query("SELECT status FROM lessons WHERE id = @id", [ ("@id", box (int64 id)) ])
+        Assert.Equal("graduated", string promoted.Rows.[0].["status"])
+        let knowledge = db.Query("SELECT id FROM knowledge WHERE content = 'Use dependency injection everywhere' AND source = 'learned'")
+        Assert.True(knowledge.Rows.Length > 0)
+
+    [<Fact>]
+    member _.``Consolidate returns no-op message when nothing to do``() =
+        let result = db.Consolidate()
+        Assert.Equal("No consolidation actions needed.", result)
+
+    [<Fact>]
+    member _.``Graduate writes to instructions file``() =
+        let instrPath = Path.Combine(Path.GetTempPath(), $"pm-test-{Guid.NewGuid()}", ".github", "copilot-instructions.md")
+        try
+            // Create knowledge with high confidence and session count
+            let id = db.StoreKnowledge("convention", "Always use strict mode", "*", "user_explicit")
+            db.Execute(
+                "UPDATE knowledge SET confidence = 0.95, session_count = 12 WHERE id = @id",
+                [ ("@id", box id) ]
+            ) |> ignore
+            let result = db.Graduate(instrPath)
+            Assert.Contains("Graduated", result)
+            let content = File.ReadAllText(instrPath)
+            Assert.Contains("## Learned Conventions", content)
+            Assert.Contains("Always use strict mode", content)
+            Assert.Contains("Auto-managed by ProjectMemory", content)
+        finally
+            let dir = Path.GetDirectoryName(instrPath) |> Path.GetDirectoryName
+            try if Directory.Exists(dir) then Directory.Delete(dir, true) with _ -> ()
+
+    [<Fact>]
+    member _.``Graduate is idempotent``() =
+        let instrPath = Path.Combine(Path.GetTempPath(), $"pm-test-{Guid.NewGuid()}", ".github", "copilot-instructions.md")
+        try
+            let id = db.StoreKnowledge("convention", "Idempotent test rule", "*", "user_explicit")
+            db.Execute(
+                "UPDATE knowledge SET confidence = 0.95, session_count = 15 WHERE id = @id",
+                [ ("@id", box id) ]
+            ) |> ignore
+            db.Graduate(instrPath) |> ignore
+            let result2 = db.Graduate(instrPath)
+            Assert.Equal("No knowledge entries ready for graduation.", result2)
+            let content = File.ReadAllText(instrPath)
+            let count = content.Split("Idempotent test rule").Length - 1
+            Assert.Equal(1, count)
+        finally
+            let dir = Path.GetDirectoryName(instrPath) |> Path.GetDirectoryName
+            try if Directory.Exists(dir) then Directory.Delete(dir, true) with _ -> ()
+
+    [<Fact>]
+    member _.``GetContext records session injections when sessionId provided``() =
+        db.StoreKnowledge("convention", "Injection test rule", "*", "user_explicit") |> ignore
+        db.RecordLesson("Injection test lesson", "discovery", null, "*", 0.5, null) |> ignore
+        db.GetContext(None, 20, "test-session-123") |> ignore
+        let injections = db.Query("SELECT item_type, item_id FROM session_injections WHERE session_id = 'test-session-123'")
+        Assert.True(injections.Rows.Length >= 2)
+        let types = injections.Rows |> Array.map (fun r -> string r.["item_type"])
+        Assert.Contains("knowledge", types)
+        Assert.Contains("lesson", types)
+
+    [<Fact>]
+    member _.``GetContext does not record injections without sessionId``() =
+        db.StoreKnowledge("convention", "No injection rule", "*", "user_explicit") |> ignore
+        db.GetContext(None, 20) |> ignore
+        let injections = db.Query("SELECT COUNT(*) as cnt FROM session_injections")
+        Assert.Equal(0L, injections.Rows.[0].["cnt"] :?> int64)
+
+    [<Fact>]
+    member _.``MarkUseful bumps knowledge confidence when useful``() =
+        let id = db.StoreKnowledge("convention", "Mark useful test rule", "*", "user_explicit")
+        let before = (db.Query("SELECT confidence FROM knowledge WHERE id = @id", [ ("@id", box id) ])).Rows.[0].["confidence"] :?> double
+        db.GetContext(None, 20, "mark-useful-session") |> ignore
+        let result = db.MarkUseful("mark-useful-session", id, true)
+        Assert.Contains("Feedback recorded", result)
+        let after = (db.Query("SELECT confidence FROM knowledge WHERE id = @id", [ ("@id", box id) ])).Rows.[0].["confidence"] :?> double
+        Assert.True(after > before)
+
+    [<Fact>]
+    member _.``MarkUseful decreases confidence when not useful``() =
+        let id = db.StoreKnowledge("convention", "Not useful test rule", "*", "user_explicit")
+        let before = (db.Query("SELECT confidence FROM knowledge WHERE id = @id", [ ("@id", box id) ])).Rows.[0].["confidence"] :?> double
+        db.GetContext(None, 20, "mark-notuseful-session") |> ignore
+        db.MarkUseful("mark-notuseful-session", id, false) |> ignore
+        let after = (db.Query("SELECT confidence FROM knowledge WHERE id = @id", [ ("@id", box id) ])).Rows.[0].["confidence"] :?> double
+        Assert.True(after < before)
+
+    [<Fact>]
+    member _.``MarkUseful returns not found for missing injection``() =
+        let result = db.MarkUseful("nonexistent-session", "nonexistent-id", true)
+        Assert.Contains("No injection record found", result)
+
