@@ -16,27 +16,79 @@ ProjectMemory maintains a SQLite database of project-specific knowledge — conv
 | `project_forget` | Remove wrong or outdated knowledge |
 | `record_lesson` | Record something learned during a session |
 | `mark_useful` | Feedback on whether injected knowledge helped |
+| `consolidate` | Merge near-duplicate lessons, promote high-recurrence lessons, prune stale entries |
+| `graduate` | Promote high-confidence knowledge to copilot-instructions.md |
+| `export_knowledge` | Export all knowledge and lessons as JSON |
+| `import_knowledge` | Import knowledge from JSON (deduplicates automatically) |
 
 ## Setup
 
-### Prerequisites
+### Option 1: Self-Contained Executable (no SDK required)
 
-- .NET 10 SDK
+Publish a single-file executable:
 
-### Configure in Your Repository
+```bash
+dotnet publish src/ProjectMemory.Server -c Release -r win-x64 -o publish/win-x64
+# Also available: linux-x64, osx-arm64
+```
 
-Add to `.github/mcp.json`:
+Configure in `~/.copilot/mcp-config.json` (user-level) or `.github/mcp.json` (repo-level):
 
 ```json
 {
-  "servers": {
+  "mcpServers": {
     "project-memory": {
-      "command": "dotnet",
-      "args": ["run", "--project", "/path/to/ProjectMemory.Server"]
+      "command": "C:/path/to/ProjectMemory.Server.exe",
+      "args": []
     }
   }
 }
 ```
+
+### Option 2: NuGet Tool (requires .NET 10 runtime)
+
+Pack and install as a global dotnet tool:
+
+```bash
+dotnet pack src/ProjectMemory.Server -c Release -o nupkg
+dotnet tool install -g --add-source ./nupkg ProjectMemory
+```
+
+Then configure:
+
+```json
+{
+  "mcpServers": {
+    "project-memory": {
+      "command": "project-memory",
+      "args": []
+    }
+  }
+}
+```
+
+Update later with:
+
+```bash
+dotnet tool update -g --add-source ./nupkg ProjectMemory
+```
+
+### Option 3: From Source (requires .NET 10 SDK)
+
+```json
+{
+  "mcpServers": {
+    "project-memory": {
+      "command": "dotnet",
+      "args": ["run", "--no-build", "-c", "Release", "--project", "/path/to/ProjectMemory/src/ProjectMemory.Server"]
+    }
+  }
+}
+```
+
+Build Release first: `dotnet build -c Release`
+
+### Database Location
 
 The database is created at `.project-memory/memory.db` in the working directory. Override with `PROJECT_MEMORY_DB` environment variable.
 
@@ -64,7 +116,7 @@ You have access to a project memory database via the project-memory MCP server.
 
 ## Scope Filtering
 
-Knowledge entries can be scoped to specific files using glob patterns:
+Knowledge and lessons can be scoped to specific files using glob patterns:
 
 - `*` — project-wide (default)
 - `src/Auth/*` — everything in Auth directory
@@ -72,31 +124,34 @@ Knowledge entries can be scoped to specific files using glob patterns:
 - `*.fsproj` — all F# project files
 
 When `get_context(scope: "src/Auth/Login.fs")` is called, it returns:
-1. All project-wide (`*`) knowledge
-2. Knowledge scoped to patterns matching that path (e.g., `src/Auth/*`)
+1. All project-wide (`*`) knowledge and lessons
+2. Items scoped to patterns matching that path (e.g., `src/Auth/*`)
 
-## Learning Pipeline (Roadmap)
+## Learning Pipeline
 
-**Phase 1** (current): Manual knowledge store — you tell it what to remember.
-
-**Phase 2**: Lesson capture — the assistant records lessons when corrected, and deduplicates them automatically.
-
-**Phase 3**: Consolidation & graduation — high-confidence lessons (seen across many sessions) auto-graduate to `.github/copilot-instructions.md`.
+1. **Lesson capture** — The assistant records lessons when corrected. Fuzzy deduplication (Jaccard similarity >70%) prevents near-duplicate entries.
+2. **Consolidation** — Merges similar lessons (>80% similarity), promotes lessons with high recurrence (≥5) and confidence (≥0.7) to knowledge, prunes stale entries.
+3. **Graduation** — Knowledge entries reaching confidence ≥0.9 and session count ≥10 are appended to `.github/copilot-instructions.md` under an auto-managed section. Configurable via `PROJECT_MEMORY_INSTRUCTIONS_FILE` env var.
 
 ## Build & Test
 
 ```bash
 dotnet build
 dotnet test
+dotnet build -c Release          # For MCP / distribution
 ```
 
 ## Architecture
 
 ```
 ProjectMemory.Server/
-├── Database.fs    # SQLite schema, CRUD, context formatting
-├── Tools.fs       # MCP tool definitions (thin wrappers)
-└── Program.fs     # MCP server entry point (STDIO transport)
+├── Schema.fs           # DDL and schema versioning
+├── Similarity.fs       # Jaccard text similarity (pure function)
+├── Formatting.fs       # Context output formatting with token budgeting (pure function)
+├── InstructionsFile.fs # Graduation file I/O (pure function)
+├── Database.fs         # ProjectMemoryDb class — all DB operations
+├── Tools.fs            # MCP tool adapter layer with input validation
+└── Program.fs          # Host setup, DI, STDIO transport
 ```
 
 The server uses STDIO transport — the MCP client (Copilot CLI, VS Code) launches it as a subprocess and communicates via stdin/stdout. All logging goes to stderr.
