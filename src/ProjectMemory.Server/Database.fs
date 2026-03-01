@@ -8,11 +8,14 @@ open System.Text.Json
 open Microsoft.Data.Sqlite
 
 type ProjectMemoryDb(dbPath: string) =
-    let connectionString = $"Data Source={dbPath};Mode=ReadWriteCreate;Default Timeout=5"
+    let connectionString = $"Data Source={dbPath};Mode=ReadWriteCreate"
 
     let withConnection f =
         use conn = new SqliteConnection(connectionString)
         conn.Open()
+        use bt = conn.CreateCommand()
+        bt.CommandText <- "PRAGMA busy_timeout=5000;"
+        bt.ExecuteNonQuery() |> ignore
         f conn
 
     let addParams (cmd: SqliteCommand) (parameters: (string * obj) list) =
@@ -26,7 +29,7 @@ type ProjectMemoryDb(dbPath: string) =
             Directory.CreateDirectory(dir) |> ignore
         withConnection (fun conn ->
             use pragma = conn.CreateCommand()
-            pragma.CommandText <- "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;"
+            pragma.CommandText <- "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;"
             pragma.ExecuteNonQuery() |> ignore
 
             // Create schema version table and base schema
