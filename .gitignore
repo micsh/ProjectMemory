@@ -15,6 +15,7 @@ obj/
 ## Build
 publish/
 artifacts/
+nupkg/
 
 ## Database files (created at runtime)
 .project-memory/
