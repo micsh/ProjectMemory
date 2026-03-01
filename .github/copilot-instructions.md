@@ -1,5 +1,15 @@
 # Copilot Instructions for ProjectMemory
 
+## Project Memory — READ THIS FIRST
+
+You have access to a project memory MCP server. Follow these rules:
+
+1. **SESSION START:** Call `get_context()` BEFORE doing any work. This loads project knowledge from prior sessions.
+2. **AFTER EVERY USER CORRECTION:** Stop. Call `record_lesson()` with what you learned BEFORE continuing with the fix. Format: "When [situation], [action], because [reason]".
+3. **WHEN YOU DISCOVER A PATTERN:** Call `project_store()` to remember conventions, decisions, or known issues.
+4. **WHEN KNOWLEDGE IS WRONG:** Call `project_forget()` to remove it.
+5. **SESSION END:** Before the user exits, review the session. Call `record_lesson()` for each non-obvious thing you learned.
+
 ## Project Overview
 ProjectMemory is an MCP (Model Context Protocol) server that gives AI coding assistants persistent memory across sessions. It stores knowledge, lessons learned, and conventions in a local SQLite database.
 
