@@ -4,6 +4,7 @@ open System
 open System.IO
 open System.Security.Cryptography
 open System.Text
+open System.Text.Json
 open Microsoft.Data.Sqlite
 
 type ProjectMemoryDb(dbPath: string) =
@@ -27,9 +28,40 @@ type ProjectMemoryDb(dbPath: string) =
             use pragma = conn.CreateCommand()
             pragma.CommandText <- "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;"
             pragma.ExecuteNonQuery() |> ignore
+
+            // Create schema version table and base schema
+            use verCmd = conn.CreateCommand()
+            verCmd.CommandText <- Schema.versionTable
+            verCmd.ExecuteNonQuery() |> ignore
+
             use cmd = conn.CreateCommand()
             cmd.CommandText <- Schema.ddl
             cmd.ExecuteNonQuery() |> ignore
+
+            // Check current version
+            use getVer = conn.CreateCommand()
+            getVer.CommandText <- "SELECT COALESCE(MAX(version), 0) FROM schema_version"
+            let dbVersion = getVer.ExecuteScalar() :?> int64 |> int
+
+            // Run pending migrations
+            for targetVersion, sql in Schema.migrations do
+                if targetVersion > dbVersion then
+                    use migrate = conn.CreateCommand()
+                    migrate.CommandText <- sql
+                    migrate.ExecuteNonQuery() |> ignore
+                    use record = conn.CreateCommand()
+                    record.CommandText <- "INSERT INTO schema_version (version, applied_at) VALUES (@v, @now)"
+                    record.Parameters.AddWithValue("@v", targetVersion) |> ignore
+                    record.Parameters.AddWithValue("@now", DateTime.UtcNow.ToString("o")) |> ignore
+                    record.ExecuteNonQuery() |> ignore
+
+            // Ensure current version is recorded
+            if dbVersion < Schema.currentVersion then
+                use setVer = conn.CreateCommand()
+                setVer.CommandText <- "INSERT INTO schema_version (version, applied_at) SELECT @v, @now WHERE NOT EXISTS (SELECT 1 FROM schema_version WHERE version = @v)"
+                setVer.Parameters.AddWithValue("@v", Schema.currentVersion) |> ignore
+                setVer.Parameters.AddWithValue("@now", DateTime.UtcNow.ToString("o")) |> ignore
+                setVer.ExecuteNonQuery() |> ignore
         )
 
     static member GenerateId(parts: string list) =
@@ -181,7 +213,7 @@ type ProjectMemoryDb(dbPath: string) =
 
     // --- Context ---
 
-    member this.GetContext(scope: string option, limit: int, ?sessionId: string) : string =
+    member this.GetContext(scope: string option, limit: int, ?sessionId: string, ?maxTokens: int) : string =
         let knowledgeResult =
             match scope with
             | Some s ->
@@ -223,7 +255,7 @@ type ProjectMemoryDb(dbPath: string) =
                 ) |> ignore
         | _ -> ()
 
-        Formatting.formatContext knowledgeResult.Rows lessonResult.Rows
+        Formatting.formatContext knowledgeResult.Rows lessonResult.Rows (defaultArg maxTokens 2000)
 
     // --- Consolidation ---
 
@@ -327,3 +359,69 @@ type ProjectMemoryDb(dbPath: string) =
             let sectionContent = InstructionsFile.buildSection allInstructions
             InstructionsFile.mergeIntoFile instructionsPath sectionContent
             sb.ToString().TrimEnd()
+
+    // --- Import/Export ---
+
+    member this.Export() : string =
+        let knowledge =
+            this.Query("SELECT id, category, scope, content, confidence, source, session_count FROM knowledge ORDER BY category, content")
+        let lessons =
+            this.Query("SELECT lesson_text, trigger, scope, recurrence, confidence, status FROM lessons ORDER BY status, recurrence DESC")
+
+        use stream = new MemoryStream()
+        use writer = new Utf8JsonWriter(stream, JsonWriterOptions(Indented = true))
+        writer.WriteStartObject()
+
+        writer.WriteStartArray("knowledge")
+        for row in knowledge.Rows do
+            writer.WriteStartObject()
+            writer.WriteString("id", string row.["id"])
+            writer.WriteString("category", string row.["category"])
+            writer.WriteString("scope", string row.["scope"])
+            writer.WriteString("content", string row.["content"])
+            writer.WriteNumber("confidence", row.["confidence"] :?> double)
+            writer.WriteString("source", string row.["source"])
+            writer.WriteNumber("session_count", row.["session_count"] :?> int64)
+            writer.WriteEndObject()
+        writer.WriteEndArray()
+
+        writer.WriteStartArray("lessons")
+        for row in lessons.Rows do
+            writer.WriteStartObject()
+            writer.WriteString("lesson_text", string row.["lesson_text"])
+            writer.WriteString("trigger", string row.["trigger"])
+            writer.WriteString("scope", string row.["scope"])
+            writer.WriteNumber("recurrence", row.["recurrence"] :?> int64)
+            writer.WriteNumber("confidence", row.["confidence"] :?> double)
+            writer.WriteString("status", string row.["status"])
+            writer.WriteEndObject()
+        writer.WriteEndArray()
+
+        writer.WriteEndObject()
+        writer.Flush()
+        Encoding.UTF8.GetString(stream.ToArray())
+
+    member this.Import(json: string) : string =
+        let doc = JsonDocument.Parse(json)
+        let mutable knowledgeCount = 0
+        let mutable lessonCount = 0
+
+        if doc.RootElement.TryGetProperty("knowledge") |> fst then
+            for item in doc.RootElement.GetProperty("knowledge").EnumerateArray() do
+                let category = item.GetProperty("category").GetString()
+                let content = item.GetProperty("content").GetString()
+                let scope = if item.TryGetProperty("scope") |> fst then item.GetProperty("scope").GetString() else "*"
+                let source = if item.TryGetProperty("source") |> fst then item.GetProperty("source").GetString() else "imported"
+                this.StoreKnowledge(category, content, scope, source) |> ignore
+                knowledgeCount <- knowledgeCount + 1
+
+        if doc.RootElement.TryGetProperty("lessons") |> fst then
+            for item in doc.RootElement.GetProperty("lessons").EnumerateArray() do
+                let text = item.GetProperty("lesson_text").GetString()
+                let trigger = if item.TryGetProperty("trigger") |> fst then item.GetProperty("trigger").GetString() else "explicit"
+                let scope = if item.TryGetProperty("scope") |> fst then item.GetProperty("scope").GetString() else "*"
+                let confidence = if item.TryGetProperty("confidence") |> fst then item.GetProperty("confidence").GetDouble() else 0.3
+                this.RecordLesson(text, trigger, null, scope, confidence, null) |> ignore
+                lessonCount <- lessonCount + 1
+
+        $"Imported {knowledgeCount} knowledge entries, {lessonCount} lessons (duplicates merged automatically)."

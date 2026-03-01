@@ -6,6 +6,15 @@ type QueryResult = {
 }
 
 module Schema =
+    let currentVersion = 1
+
+    let versionTable = """
+        CREATE TABLE IF NOT EXISTS schema_version (
+            version INTEGER NOT NULL,
+            applied_at TEXT NOT NULL
+        );
+    """
+
     let ddl = """
         CREATE TABLE IF NOT EXISTS knowledge (
             id TEXT PRIMARY KEY,
@@ -50,3 +59,10 @@ module Schema =
             instruction_text TEXT NOT NULL
         );
     """
+
+    /// Migrations keyed by target version. Each runs when upgrading from version-1 to version.
+    let migrations: (int * string) list =
+        [
+            // Future migrations go here:
+            // (2, "ALTER TABLE knowledge ADD COLUMN embedding BLOB;")
+        ]

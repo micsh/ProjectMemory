@@ -4,7 +4,21 @@ open System
 open System.ComponentModel
 open System.IO
 open System.Runtime.InteropServices
+open System.Text.Json
+open Microsoft.Data.Sqlite
 open ModelContextProtocol.Server
+
+module private Errors =
+    let validCategories = set [ "convention"; "decision"; "known_issue"; "file_note"; "preference" ]
+    let validTriggers = set [ "user_correction"; "build_failure"; "repeated_pattern"; "discovery"; "explicit" ]
+
+    let friendly (ex: exn) =
+        match ex with
+        | :? SqliteException as se when se.SqliteErrorCode = 5 ->
+            "Error: Database is busy. Another process may be using it — try again in a moment."
+        | :? JsonException ->
+            "Error: Invalid JSON format. Expected an object with 'knowledge' and/or 'lessons' arrays."
+        | _ -> $"Error: {ex.Message}"
 
 [<McpServerToolType>]
 type KnowledgeTools(db: ProjectMemoryDb) =
@@ -55,7 +69,7 @@ type KnowledgeTools(db: ProjectMemoryDb) =
                         sb.AppendLine(String.concat " | " values) |> ignore
                     sb.ToString().TrimEnd()
             with ex ->
-                $"Error: {ex.Message}"
+                Errors.friendly ex
 
     [<McpServerTool(Name = "project_store")>]
     [<Description("Store project knowledge. Categories: convention, decision, known_issue, file_note, preference. Auto-deduplicates — storing same content bumps confidence.")>]
@@ -69,12 +83,17 @@ type KnowledgeTools(db: ProjectMemoryDb) =
             [<Description("File glob this applies to, or '*' for project-wide")>]
             scope: string
         ) =
+        if not (Errors.validCategories.Contains(category)) then
+            $"Error: Invalid category '{category}'. Valid categories: convention, decision, known_issue, file_note, preference."
+        elif String.IsNullOrWhiteSpace(content) then
+            "Error: Content cannot be empty."
+        else
         try
             let scope = if String.IsNullOrEmpty(scope) then "*" else scope
             let id = db.StoreKnowledge(category, content, scope, "user_explicit")
             $"Stored with id: {id}"
         with ex ->
-            $"Error: {ex.Message}"
+            Errors.friendly ex
 
     [<McpServerTool(Name = "project_forget")>]
     [<Description("Remove a knowledge entry by ID. Use when stored knowledge is wrong or outdated.")>]
@@ -101,6 +120,11 @@ type KnowledgeTools(db: ProjectMemoryDb) =
             [<Description("File glob this lesson applies to")>]
             scope: string
         ) =
+        if String.IsNullOrWhiteSpace(lesson) then
+            "Error: Lesson text cannot be empty."
+        elif not (Errors.validTriggers.Contains(trigger)) then
+            $"Error: Invalid trigger '{trigger}'. Valid triggers: user_correction, build_failure, repeated_pattern, discovery, explicit."
+        else
         try
             let scope = if String.IsNullOrEmpty(scope) then "*" else scope
             let confidence =
@@ -110,7 +134,7 @@ type KnowledgeTools(db: ProjectMemoryDb) =
             let id = db.RecordLesson(lesson, trigger, agentRole, scope, confidence, null)
             $"Lesson recorded with id: {id}"
         with ex ->
-            $"Error: {ex.Message}"
+            Errors.friendly ex
 
     [<McpServerTool(Name = "mark_useful")>]
     [<Description("Feedback on whether injected knowledge was useful. Improves future context selection.")>]
@@ -126,7 +150,7 @@ type KnowledgeTools(db: ProjectMemoryDb) =
         try
             db.MarkUseful(sessionId, itemId, useful)
         with ex ->
-            $"Error: {ex.Message}"
+            Errors.friendly ex
 
     [<McpServerTool(Name = "consolidate")>]
     [<Description("Consolidate lessons: merge near-duplicates, promote high-recurrence lessons to knowledge, prune stale entries. Run periodically or after bulk lesson recording.")>]
@@ -134,7 +158,7 @@ type KnowledgeTools(db: ProjectMemoryDb) =
         try
             db.Consolidate()
         with ex ->
-            $"Error: {ex.Message}"
+            Errors.friendly ex
 
     [<McpServerTool(Name = "graduate")>]
     [<Description("Graduate high-confidence knowledge to copilot-instructions.md. Appends entries with confidence >= 0.9 and session_count >= 10 to an auto-managed section.")>]
@@ -147,4 +171,24 @@ type KnowledgeTools(db: ProjectMemoryDb) =
                 | path -> path
             db.Graduate(instructionsPath)
         with ex ->
-            $"Error: {ex.Message}"
+            Errors.friendly ex
+
+    [<McpServerTool(Name = "export_knowledge")>]
+    [<Description("Export all knowledge and lessons as JSON. Useful for sharing across repos or backing up.")>]
+    member _.ExportKnowledge() =
+        try
+            db.Export()
+        with ex ->
+            Errors.friendly ex
+
+    [<McpServerTool(Name = "import_knowledge")>]
+    [<Description("Import knowledge and lessons from JSON. Duplicates are merged automatically. Use to seed a new repo or share across team.")>]
+    member _.ImportKnowledge
+        (
+            [<Description("JSON string with 'knowledge' and/or 'lessons' arrays")>]
+            json: string
+        ) =
+        try
+            db.Import(json)
+        with ex ->
+            Errors.friendly ex

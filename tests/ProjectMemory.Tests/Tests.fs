@@ -27,6 +27,12 @@ type DatabaseTests() =
         Assert.Contains("lessons", tables)
         Assert.Contains("session_injections", tables)
         Assert.Contains("graduations", tables)
+        Assert.Contains("schema_version", tables)
+
+    [<Fact>]
+    member _.``Schema version is recorded``() =
+        let result = db.Query("SELECT MAX(version) as v FROM schema_version")
+        Assert.Equal(int64 Schema.currentVersion, result.Rows.[0].["v"] :?> int64)
 
     [<Fact>]
     member _.``Stores and retrieves knowledge``() =
@@ -287,4 +293,45 @@ type DatabaseTests() =
     member _.``MarkUseful returns not found for missing injection``() =
         let result = db.MarkUseful("nonexistent-session", "nonexistent-id", true)
         Assert.Contains("No injection record found", result)
+
+    [<Fact>]
+    member _.``GetContext respects token budget``() =
+        for i in 1..20 do
+            db.StoreKnowledge("convention", $"This is a long convention rule number {i} that takes up token space in the context window", "*", "user_explicit") |> ignore
+        let small = db.GetContext(None, 100, maxTokens = 100)
+        let large = db.GetContext(None, 100, maxTokens = 5000)
+        Assert.True(small.Length < large.Length)
+
+    [<Fact>]
+    member _.``estimateTokens approximates correctly``() =
+        Assert.Equal(1, Formatting.estimateTokens "hi")
+        Assert.True(Formatting.estimateTokens (String.replicate 100 "word ") > 100)
+
+    [<Fact>]
+    member _.``Export produces valid JSON with knowledge and lessons``() =
+        db.StoreKnowledge("convention", "Export test rule", "*", "user_explicit") |> ignore
+        db.RecordLesson("Export test lesson", "discovery", null, "*", 0.3, null) |> ignore
+        let json = db.Export()
+        Assert.Contains("\"knowledge\"", json)
+        Assert.Contains("\"lessons\"", json)
+        Assert.Contains("Export test rule", json)
+        Assert.Contains("Export test lesson", json)
+
+    [<Fact>]
+    member _.``Import round-trips through Export``() =
+        db.StoreKnowledge("decision", "Round trip rule", "*", "user_explicit") |> ignore
+        db.RecordLesson("Round trip lesson", "explicit", null, "src/*", 0.7, null) |> ignore
+        let json = db.Export()
+        let freshPath = Path.Combine(Path.GetTempPath(), $"pm-test-{Guid.NewGuid()}.db")
+        try
+            let freshDb = ProjectMemoryDb(freshPath)
+            let result = freshDb.Import(json)
+            Assert.Contains("1 knowledge entries", result)
+            Assert.Contains("1 lessons", result)
+            let knowledge = freshDb.Query("SELECT content FROM knowledge WHERE content = 'Round trip rule'")
+            Assert.Equal(1, knowledge.Rows.Length)
+            let lesson = freshDb.Query("SELECT lesson_text FROM lessons WHERE lesson_text = 'Round trip lesson'")
+            Assert.Equal(1, lesson.Rows.Length)
+        finally
+            try File.Delete(freshPath) with _ -> ()
 
