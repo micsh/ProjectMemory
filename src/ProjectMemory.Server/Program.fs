@@ -24,6 +24,7 @@ let main args =
         .AddMcpServer()
         .WithStdioServerTransport()
         .WithToolsFromAssembly()
+        .WithResourcesFromAssembly()
     |> ignore
 
     builder.Build().RunAsync().GetAwaiter().GetResult()

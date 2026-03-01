@@ -335,3 +335,23 @@ type DatabaseTests() =
         finally
             try File.Delete(freshPath) with _ -> ()
 
+    // --- Resource tests ---
+
+    [<Fact>]
+    member _.``Resource returns full context``() =
+        db.StoreKnowledge("convention", "Resource test convention", "*", "user_explicit") |> ignore
+        db.RecordLesson("Resource test lesson", "explicit", null, "*", 0.5, null) |> ignore
+        let resources = MemoryResources(db)
+        let result = resources.GetFullContext()
+        Assert.Contains("Resource test convention", result)
+        Assert.Contains("Resource test lesson", result)
+
+    [<Fact>]
+    member _.``Resource returns scoped context``() =
+        db.StoreKnowledge("convention", "Global rule", "*", "user_explicit") |> ignore
+        db.StoreKnowledge("file_note", "FS-only rule", "src/*.fs", "user_explicit") |> ignore
+        let resources = MemoryResources(db)
+        let scoped = resources.GetScopedContext("src/Main.fs")
+        Assert.Contains("Global rule", scoped)
+        Assert.Contains("FS-only rule", scoped)
+
