@@ -23,11 +23,34 @@ ProjectMemory maintains a SQLite database of project-specific knowledge — conv
 
 ## Setup
 
-### Option 1: Self-Contained Executable (no SDK required)
+### Option 1: Download from GitHub Releases (recommended)
+
+Download the latest release for your platform from [Releases](https://github.com/micsh/ProjectMemory/releases):
+
+- `ProjectMemory-win-x64.zip` — Windows
+- `ProjectMemory-linux-x64.tar.gz` — Linux
+- `ProjectMemory-osx-arm64.tar.gz` — macOS (Apple Silicon)
+
+Extract and configure in `~/.copilot/mcp-config.json` (user-level) or `.github/mcp.json` (repo-level):
+
+```json
+{
+  "mcpServers": {
+    "project-memory": {
+      "command": "/path/to/ProjectMemory.Server",
+      "args": []
+    }
+  }
+}
+```
+
+### Option 2: Build from Source (requires .NET 10 SDK)
 
 Publish a single-file executable:
 
 ```bash
+git clone https://github.com/micsh/ProjectMemory.git
+cd ProjectMemory
 dotnet publish src/ProjectMemory.Server -c Release -r win-x64 -o publish/win-x64
 # Also available: linux-x64, osx-arm64
 ```
@@ -45,7 +68,7 @@ Configure in `~/.copilot/mcp-config.json` (user-level) or `.github/mcp.json` (re
 }
 ```
 
-### Option 2: NuGet Tool (requires .NET 10 runtime)
+### Option 3: NuGet Tool (requires .NET 10 runtime)
 
 Pack and install as a global dotnet tool:
 
@@ -73,7 +96,7 @@ Update later with:
 dotnet tool update -g --add-source ./nupkg ProjectMemory
 ```
 
-### Option 3: From Source (requires .NET 10 SDK)
+### Option 4: From Source (requires .NET 10 SDK)
 
 ```json
 {
@@ -151,6 +174,7 @@ ProjectMemory.Server/
 ├── InstructionsFile.fs # Graduation file I/O (pure function)
 ├── Database.fs         # ProjectMemoryDb class — all DB operations
 ├── Tools.fs            # MCP tool adapter layer with input validation
+├── Resources.fs        # MCP resource endpoints (memory://context)
 └── Program.fs          # Host setup, DI, STDIO transport
 ```
 
