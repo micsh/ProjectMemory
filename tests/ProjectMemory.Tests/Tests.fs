@@ -288,8 +288,10 @@ type DatabaseTests() =
     [<Fact>]
     member _.``MarkUseful decreases confidence when not useful``() =
         let id = db.StoreKnowledge("convention", "Not useful test rule", "*", "user_explicit")
-        let before = (db.Query("SELECT confidence FROM knowledge WHERE id = @id", [ ("@id", box id) ])).Rows.[0].["confidence"] :?> double
         db.GetContextAndTrack(None, 20, "mark-notuseful-session") |> ignore
+        // Capture confidence after surfacing (which bumps +0.05) so we measure the
+        // MarkUseful(false) delta (-0.05) in isolation.
+        let before = (db.Query("SELECT confidence FROM knowledge WHERE id = @id", [ ("@id", box id) ])).Rows.[0].["confidence"] :?> double
         db.MarkUseful("mark-notuseful-session", id, false) |> ignore
         let after = (db.Query("SELECT confidence FROM knowledge WHERE id = @id", [ ("@id", box id) ])).Rows.[0].["confidence"] :?> double
         Assert.True(after < before)

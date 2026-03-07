@@ -119,6 +119,49 @@ type DomainService(db: ProjectMemoryDb, instructionsPath: string) =
         if pruned > 0 then
             sb.AppendLine($"Pruned {pruned} stale lesson(s)") |> ignore
 
+        // Confidence decay: items not surfaced in the last 5 distinct sessions lose
+        // 0.03 confidence per Consolidate call. Uses a named CTE to identify recent
+        // sessions — never an inline correlated subquery.
+        // Edge cases: fewer than 5 sessions → CTE returns however many exist, all
+        // unseen items decay. Zero sessions → all active items decay (correct — nothing
+        // has been surfaced yet). Confidence floor is 0.0.
+        let recentSessionsCte =
+            "WITH recent_sessions AS (SELECT session_id FROM session_injections GROUP BY session_id ORDER BY MAX(injected_at) DESC LIMIT 5)"
+
+        let knowledgeDecayed =
+            db.Execute(
+                $"{recentSessionsCte} UPDATE knowledge SET confidence = MAX(confidence - 0.03, 0.0), updated_at = @now WHERE status = 'active' AND id NOT IN (SELECT DISTINCT item_id FROM session_injections WHERE item_type = 'knowledge' AND session_id IN (SELECT session_id FROM recent_sessions))",
+                [ ("@now", box now) ]
+            )
+        let lessonDecayed =
+            db.Execute(
+                $"{recentSessionsCte} UPDATE lessons SET confidence = MAX(confidence - 0.03, 0.0), updated_at = @now WHERE status = 'active' AND id NOT IN (SELECT DISTINCT CAST(item_id AS INTEGER) FROM session_injections WHERE item_type = 'lesson' AND session_id IN (SELECT session_id FROM recent_sessions))",
+                [ ("@now", box now) ]
+            )
+        let totalDecayed = knowledgeDecayed + lessonDecayed
+
+        // Auto-archive items whose confidence fell below 0.2 (threshold is strict <).
+        // Item at exactly 0.2 is preserved. Archived items are excluded from
+        // GetContext results but remain in the DB for audit / manual recovery.
+        // Note: an item may graduate (to copilot-instructions.md) and later be archived
+        // in the DB — the instructions file has no removal mechanism (known asymmetry).
+        let knowledgeArchived =
+            db.Execute(
+                "UPDATE knowledge SET status = 'archived', updated_at = @now WHERE status = 'active' AND confidence < 0.2",
+                [ ("@now", box now) ]
+            )
+        let lessonArchived =
+            db.Execute(
+                "UPDATE lessons SET status = 'archived', updated_at = @now WHERE status = 'active' AND confidence < 0.2",
+                [ ("@now", box now) ]
+            )
+        let totalArchived = knowledgeArchived + lessonArchived
+
+        if totalDecayed > 0 then
+            sb.AppendLine($"Decayed {totalDecayed} item(s)") |> ignore
+        if totalArchived > 0 then
+            sb.AppendLine($"Archived {totalArchived} item(s) below confidence threshold") |> ignore
+
         let result = sb.ToString().TrimEnd()
         if String.IsNullOrWhiteSpace(result) then "No consolidation actions needed."
         else result

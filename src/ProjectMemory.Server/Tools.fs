@@ -38,7 +38,7 @@ type KnowledgeTools(db: ProjectMemoryDb, domainService: DomainService) =
         db.GetContextAndTrack(scope, 10, sessionId)
 
     [<McpServerTool(Name = "project_query")>]
-    [<Description("Run read-only SQL against the project memory database. Tables: knowledge(id,category,scope,content,confidence,source,session_count), lessons(id,lesson_text,trigger,scope,recurrence,confidence,status)")>]
+    [<Description("Run read-only SQL against the project memory database. Tables: knowledge(id,category,scope,content,confidence,source,session_count,last_surfaced_at,status), lessons(id,lesson_text,trigger,scope,recurrence,confidence,status,last_surfaced_at)")>]
     member _.ProjectQuery
         (
             [<Description("SQL SELECT query")>]

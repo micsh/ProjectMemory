@@ -53,16 +53,17 @@ type ProjectMemoryDb(dbPath: string) =
             getVer.CommandText <- "SELECT COALESCE(MAX(version), 0) FROM schema_version"
             let dbVersion = getVer.ExecuteScalar() :?> int64 |> int
 
-            // Run pending migrations — each DDL + version INSERT is one atomic unit.
-            // If a crash occurs mid-migration the transaction rolls back, leaving
-            // schema_version at the previous value so the migration re-runs cleanly.
-            for targetVersion, sql in Schema.migrations do
+            // Run pending migrations — each version's statements + version INSERT execute
+            // in one transaction. A crash before Commit() leaves schema_version unchanged
+            // so the migration re-runs cleanly on next start.
+            for targetVersion, statements in Schema.migrations do
                 if targetVersion > dbVersion then
                     use tx = conn.BeginTransaction()
-                    use migrate = conn.CreateCommand()
-                    migrate.Transaction <- tx
-                    migrate.CommandText <- sql
-                    migrate.ExecuteNonQuery() |> ignore
+                    for sql in statements do
+                        use migrate = conn.CreateCommand()
+                        migrate.Transaction <- tx
+                        migrate.CommandText <- sql
+                        migrate.ExecuteNonQuery() |> ignore
                     use record = conn.CreateCommand()
                     record.Transaction <- tx
                     record.CommandText <- "INSERT INTO schema_version (version, applied_at) VALUES (@v, @now)"
@@ -268,12 +269,12 @@ type ProjectMemoryDb(dbPath: string) =
             match scope with
             | Some s ->
                 this.Query(
-                    "SELECT id, category, content, confidence, session_count, scope FROM knowledge WHERE scope = '*' OR @scope GLOB scope ORDER BY CASE WHEN scope != '*' THEN 1 ELSE 0 END DESC, confidence DESC, updated_at DESC LIMIT @limit",
+                    "SELECT id, category, content, confidence, session_count, scope FROM knowledge WHERE status = 'active' AND (scope = '*' OR @scope GLOB scope) ORDER BY CASE WHEN scope != '*' THEN 1 ELSE 0 END DESC, confidence DESC, updated_at DESC LIMIT @limit",
                     [ ("@scope", box s); ("@limit", box limit) ]
                 )
             | None ->
                 this.Query(
-                    "SELECT id, category, content, confidence, session_count, scope FROM knowledge ORDER BY CASE WHEN scope != '*' THEN 1 ELSE 0 END DESC, confidence DESC, updated_at DESC LIMIT @limit",
+                    "SELECT id, category, content, confidence, session_count, scope FROM knowledge WHERE status = 'active' ORDER BY CASE WHEN scope != '*' THEN 1 ELSE 0 END DESC, confidence DESC, updated_at DESC LIMIT @limit",
                     [ ("@limit", box limit) ]
                 )
 
@@ -297,12 +298,12 @@ type ProjectMemoryDb(dbPath: string) =
             match scope with
             | Some s ->
                 this.Query(
-                    "SELECT id, category, content, confidence, session_count, scope FROM knowledge WHERE scope = '*' OR @scope GLOB scope ORDER BY CASE WHEN scope != '*' THEN 1 ELSE 0 END DESC, confidence DESC, updated_at DESC LIMIT @limit",
+                    "SELECT id, category, content, confidence, session_count, scope FROM knowledge WHERE status = 'active' AND (scope = '*' OR @scope GLOB scope) ORDER BY CASE WHEN scope != '*' THEN 1 ELSE 0 END DESC, confidence DESC, updated_at DESC LIMIT @limit",
                     [ ("@scope", box s); ("@limit", box limit) ]
                 )
             | None ->
                 this.Query(
-                    "SELECT id, category, content, confidence, session_count, scope FROM knowledge ORDER BY CASE WHEN scope != '*' THEN 1 ELSE 0 END DESC, confidence DESC, updated_at DESC LIMIT @limit",
+                    "SELECT id, category, content, confidence, session_count, scope FROM knowledge WHERE status = 'active' ORDER BY CASE WHEN scope != '*' THEN 1 ELSE 0 END DESC, confidence DESC, updated_at DESC LIMIT @limit",
                     [ ("@limit", box limit) ]
                 )
 
@@ -322,15 +323,38 @@ type ProjectMemoryDb(dbPath: string) =
         if knowledgeResult.Rows.Length > 0 || lessonResult.Rows.Length > 0 then
             let now = DateTime.UtcNow.ToString("o")
             for row in knowledgeResult.Rows do
-                this.Execute(
-                    "INSERT OR IGNORE INTO session_injections (session_id, item_type, item_id, injected_at) VALUES (@sid, 'knowledge', @iid, @now)",
-                    [ ("@sid", box sessionId); ("@iid", box (string row.["id"])); ("@now", box now) ]
-                ) |> ignore
+                let itemId = string row.["id"]
+                // Per-session cap: only bump confidence once per session per item
+                let alreadyTracked =
+                    this.Query(
+                        "SELECT COUNT(*) as cnt FROM session_injections WHERE session_id = @sid AND item_type = 'knowledge' AND item_id = @iid",
+                        [ ("@sid", box sessionId); ("@iid", box itemId) ]
+                    ).Rows.[0].["cnt"] :?> int64 > 0L
+                if not alreadyTracked then
+                    this.Execute(
+                        "INSERT OR IGNORE INTO session_injections (session_id, item_type, item_id, injected_at) VALUES (@sid, 'knowledge', @iid, @now)",
+                        [ ("@sid", box sessionId); ("@iid", box itemId); ("@now", box now) ]
+                    ) |> ignore
+                    this.Execute(
+                        "UPDATE knowledge SET confidence = MIN(confidence + 0.05, 1.0), last_surfaced_at = @now, updated_at = @now WHERE id = @id",
+                        [ ("@now", box now); ("@id", box itemId) ]
+                    ) |> ignore
             for row in lessonResult.Rows do
-                this.Execute(
-                    "INSERT OR IGNORE INTO session_injections (session_id, item_type, item_id, injected_at) VALUES (@sid, 'lesson', @iid, @now)",
-                    [ ("@sid", box sessionId); ("@iid", box (string (row.["id"] :?> int64))); ("@now", box now) ]
-                ) |> ignore
+                let itemId = string (row.["id"] :?> int64)
+                let alreadyTracked =
+                    this.Query(
+                        "SELECT COUNT(*) as cnt FROM session_injections WHERE session_id = @sid AND item_type = 'lesson' AND item_id = @iid",
+                        [ ("@sid", box sessionId); ("@iid", box itemId) ]
+                    ).Rows.[0].["cnt"] :?> int64 > 0L
+                if not alreadyTracked then
+                    this.Execute(
+                        "INSERT OR IGNORE INTO session_injections (session_id, item_type, item_id, injected_at) VALUES (@sid, 'lesson', @iid, @now)",
+                        [ ("@sid", box sessionId); ("@iid", box itemId); ("@now", box now) ]
+                    ) |> ignore
+                    this.Execute(
+                        "UPDATE lessons SET confidence = MIN(confidence + 0.05, 1.0), last_surfaced_at = @now, updated_at = @now WHERE id = @id",
+                        [ ("@now", box now); ("@id", box (int64 itemId)) ]
+                    ) |> ignore
 
         Formatting.formatContext knowledgeResult.Rows lessonResult.Rows (defaultArg maxTokens 2000)
 
