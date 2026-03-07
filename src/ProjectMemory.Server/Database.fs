@@ -222,7 +222,7 @@ type ProjectMemoryDb(dbPath: string) =
             // comparison. Falls back to full scan if the query token list is empty.
             let ftsQuery =
                 lessonText.ToLowerInvariant().Split([| ' '; '\t'; '\n'; '\r'; ','; '.'; ';'; ':' |], StringSplitOptions.RemoveEmptyEntries)
-                |> Array.map (fun t -> $"\"{t}\"")
+                |> Array.map (fun t -> $"\"{t.Replace('\"', ' ')}\"")
                 |> fun tokens ->
                     if tokens.Length = 0 then None
                     else Some (String.concat " OR " tokens)
@@ -264,7 +264,10 @@ type ProjectMemoryDb(dbPath: string) =
 
     // --- Context ---
 
-    member this.GetContext(scope: string option, limit: int, ?maxTokens: int) : string =
+    /// Returns (knowledgeRows, lessonRows) for the given scope and limit.
+    /// Scope-specificity ordering (CASE WHEN scope != '*') is applied only when a
+    /// scope is provided — it has no meaning for unscoped queries.
+    member private this.QueryContextRows(scope: string option, limit: int) =
         let knowledgeResult =
             match scope with
             | Some s ->
@@ -274,10 +277,9 @@ type ProjectMemoryDb(dbPath: string) =
                 )
             | None ->
                 this.Query(
-                    "SELECT id, category, content, confidence, session_count, scope FROM knowledge WHERE status = 'active' ORDER BY CASE WHEN scope != '*' THEN 1 ELSE 0 END DESC, confidence DESC, updated_at DESC LIMIT @limit",
+                    "SELECT id, category, content, confidence, session_count, scope FROM knowledge WHERE status = 'active' ORDER BY confidence DESC, updated_at DESC LIMIT @limit",
                     [ ("@limit", box limit) ]
                 )
-
         let lessonResult =
             match scope with
             | Some s ->
@@ -287,70 +289,43 @@ type ProjectMemoryDb(dbPath: string) =
                 )
             | None ->
                 this.Query(
-                    "SELECT id, lesson_text, recurrence, confidence, trigger FROM lessons WHERE status = 'active' ORDER BY CASE WHEN scope != '*' THEN 1 ELSE 0 END DESC, confidence DESC, updated_at DESC LIMIT @limit",
+                    "SELECT id, lesson_text, recurrence, confidence, trigger FROM lessons WHERE status = 'active' ORDER BY confidence DESC, updated_at DESC LIMIT @limit",
                     [ ("@limit", box limit) ]
                 )
+        knowledgeResult, lessonResult
 
+    member this.GetContext(scope: string option, limit: int, ?maxTokens: int) : string =
+        let knowledgeResult, lessonResult = this.QueryContextRows(scope, limit)
         Formatting.formatContext knowledgeResult.Rows lessonResult.Rows (defaultArg maxTokens 2000)
 
     member this.GetContextAndTrack(scope: string option, limit: int, sessionId: string, ?maxTokens: int) : string =
-        let knowledgeResult =
-            match scope with
-            | Some s ->
-                this.Query(
-                    "SELECT id, category, content, confidence, session_count, scope FROM knowledge WHERE status = 'active' AND (scope = '*' OR @scope GLOB scope) ORDER BY CASE WHEN scope != '*' THEN 1 ELSE 0 END DESC, confidence DESC, updated_at DESC LIMIT @limit",
-                    [ ("@scope", box s); ("@limit", box limit) ]
-                )
-            | None ->
-                this.Query(
-                    "SELECT id, category, content, confidence, session_count, scope FROM knowledge WHERE status = 'active' ORDER BY CASE WHEN scope != '*' THEN 1 ELSE 0 END DESC, confidence DESC, updated_at DESC LIMIT @limit",
-                    [ ("@limit", box limit) ]
-                )
-
-        let lessonResult =
-            match scope with
-            | Some s ->
-                this.Query(
-                    "SELECT id, lesson_text, recurrence, confidence, trigger FROM lessons WHERE status = 'active' AND (scope = '*' OR @scope GLOB scope) ORDER BY CASE WHEN scope != '*' THEN 1 ELSE 0 END DESC, confidence DESC, updated_at DESC LIMIT @limit",
-                    [ ("@scope", box s); ("@limit", box limit) ]
-                )
-            | None ->
-                this.Query(
-                    "SELECT id, lesson_text, recurrence, confidence, trigger FROM lessons WHERE status = 'active' ORDER BY CASE WHEN scope != '*' THEN 1 ELSE 0 END DESC, confidence DESC, updated_at DESC LIMIT @limit",
-                    [ ("@limit", box limit) ]
-                )
+        let knowledgeResult, lessonResult = this.QueryContextRows(scope, limit)
 
         if knowledgeResult.Rows.Length > 0 || lessonResult.Rows.Length > 0 then
             let now = DateTime.UtcNow.ToString("o")
             for row in knowledgeResult.Rows do
                 let itemId = string row.["id"]
-                // Per-session cap: only bump confidence once per session per item
-                let alreadyTracked =
-                    this.Query(
-                        "SELECT COUNT(*) as cnt FROM session_injections WHERE session_id = @sid AND item_type = 'knowledge' AND item_id = @iid",
-                        [ ("@sid", box sessionId); ("@iid", box itemId) ]
-                    ).Rows.[0].["cnt"] :?> int64 > 0L
-                if not alreadyTracked then
+                // INSERT OR IGNORE returns 1 if the row is new (first injection this session),
+                // 0 if it was already tracked — use the return value as the per-session cap
+                // check, eliminating a separate SELECT COUNT(*) round-trip per item.
+                let inserted =
                     this.Execute(
                         "INSERT OR IGNORE INTO session_injections (session_id, item_type, item_id, injected_at) VALUES (@sid, 'knowledge', @iid, @now)",
                         [ ("@sid", box sessionId); ("@iid", box itemId); ("@now", box now) ]
-                    ) |> ignore
+                    )
+                if inserted > 0 then
                     this.Execute(
                         "UPDATE knowledge SET confidence = MIN(confidence + 0.05, 1.0), last_surfaced_at = @now, updated_at = @now WHERE id = @id",
                         [ ("@now", box now); ("@id", box itemId) ]
                     ) |> ignore
             for row in lessonResult.Rows do
                 let itemId = string (row.["id"] :?> int64)
-                let alreadyTracked =
-                    this.Query(
-                        "SELECT COUNT(*) as cnt FROM session_injections WHERE session_id = @sid AND item_type = 'lesson' AND item_id = @iid",
-                        [ ("@sid", box sessionId); ("@iid", box itemId) ]
-                    ).Rows.[0].["cnt"] :?> int64 > 0L
-                if not alreadyTracked then
+                let inserted =
                     this.Execute(
                         "INSERT OR IGNORE INTO session_injections (session_id, item_type, item_id, injected_at) VALUES (@sid, 'lesson', @iid, @now)",
                         [ ("@sid", box sessionId); ("@iid", box itemId); ("@now", box now) ]
-                    ) |> ignore
+                    )
+                if inserted > 0 then
                     this.Execute(
                         "UPDATE lessons SET confidence = MIN(confidence + 0.05, 1.0), last_surfaced_at = @now, updated_at = @now WHERE id = @id",
                         [ ("@now", box now); ("@id", box (int64 itemId)) ]

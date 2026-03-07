@@ -154,7 +154,7 @@ type KnowledgeTools(db: ProjectMemoryDb, domainService: DomainService) =
             Errors.friendly ex
 
     [<McpServerTool(Name = "graduate")>]
-    [<Description("Graduate high-confidence knowledge to copilot-instructions.md. Appends entries with confidence >= 0.9 and session_count >= 10 to an auto-managed section.")>]
+    [<Description("Graduate high-confidence knowledge to copilot-instructions.md. Appends entries with confidence >= 0.75 and surfaced in >= 5 distinct sessions to an auto-managed section.")>]
     member _.Graduate() =
         try
             domainService.Graduate()
@@ -177,6 +177,11 @@ type KnowledgeTools(db: ProjectMemoryDb, domainService: DomainService) =
             json: string
         ) =
         try
-            db.Import(json)
+            let result = db.Import(json)
+            // Trigger consolidation after any import — Import() calls db.RecordLesson directly
+            // and bypasses DomainService.RecordLesson which owns the F3 auto-consolidation trigger.
+            // Consolidate() is a fast no-op when nothing needs merging.
+            domainService.Consolidate() |> ignore
+            result
         with ex ->
             Errors.friendly ex

@@ -66,7 +66,7 @@ type DomainService(db: ProjectMemoryDb, instructionsPath: string) =
                 let textI = string rows.[i].["lesson_text"]
                 let ftsQuery =
                     textI.ToLowerInvariant().Split([| ' '; '\t'; '\n'; '\r'; ','; '.'; ';'; ':' |], StringSplitOptions.RemoveEmptyEntries)
-                    |> Array.map (fun t -> $"\"{t}\"")
+                    |> Array.map (fun t -> $"\"{t.Replace('\"', ' ')}\"")
                     |> fun tokens ->
                         if tokens.Length = 0 then None
                         else Some (String.concat " OR " tokens)
