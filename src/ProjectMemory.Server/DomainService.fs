@@ -11,6 +11,14 @@ open System.Text
 /// DomainService — dependency flows one way: DomainService → ProjectMemoryDb.
 type DomainService(db: ProjectMemoryDb, instructionsPath: string) =
 
+    /// Minimum confidence for a knowledge item to be eligible for auto-graduation.
+    static let GraduationConfidenceThreshold = 0.75
+
+    /// Minimum number of distinct sessions in which an item must have been surfaced
+    /// before it qualifies for auto-graduation. Counts session_injections rows, NOT
+    /// the session_count field (which counts re-recordings via StoreKnowledge).
+    static let GraduationMinDistinctSessions = 5
+
     /// Record a lesson and trigger auto-consolidation when the lesson count crosses a
     /// threshold (>30 active lessons, every 5th addition). The just-inserted lesson is
     /// excluded from the consolidation pass it triggers so it cannot be immediately
@@ -27,12 +35,13 @@ type DomainService(db: ProjectMemoryDb, instructionsPath: string) =
         newId
 
     /// Consolidate active lessons: merge near-duplicates (>80% Jaccard), promote
-    /// high-recurrence lessons to knowledge, and prune stale entries.
+    /// high-recurrence lessons to knowledge, and prune stale entries. Also runs
+    /// confidence decay, auto-archive, and auto-graduation.
     ///
     /// ?excludeId: lesson rowid to exclude from this pass (used when the trigger
     /// comes from RecordLesson — prevents the just-inserted lesson being superseded
     /// by the consolidation it triggered).
-    member _.Consolidate(?excludeId: int64) : string =
+    member this.Consolidate(?excludeId: int64) : string =
         let now = DateTime.UtcNow.ToString("o")
         let sb = StringBuilder()
         let activeLessons =
@@ -64,10 +73,11 @@ type DomainService(db: ProjectMemoryDb, instructionsPath: string) =
                 let candidateIds =
                     match ftsQuery with
                     | Some q ->
-                        let r = db.Query(
-                            "SELECT l.id FROM lessons l JOIN lessons_fts f ON l.id = f.rowid WHERE f.lesson_text MATCH @q AND l.status = 'active' AND l.id != @self LIMIT 50",
-                            [ ("@q", box q); ("@self", box idI) ]
-                        )
+                        let r =
+                            db.Query(
+                                "SELECT l.id FROM lessons l JOIN lessons_fts f ON l.id = f.rowid WHERE f.lesson_text MATCH @q AND l.status = 'active' AND l.id != @self LIMIT 50",
+                                [ ("@q", box q); ("@self", box idI) ]
+                            )
                         r.Rows |> Array.map (fun row -> row.["id"] :?> int64)
                     | None -> [||]
                 // Only compare against candidates that are also in our active snapshot
@@ -162,6 +172,22 @@ type DomainService(db: ProjectMemoryDb, instructionsPath: string) =
         if totalArchived > 0 then
             sb.AppendLine($"Archived {totalArchived} item(s) below confidence threshold") |> ignore
 
+        // Auto-graduation: knowledge items that have been surfaced in enough distinct
+        // sessions and have sufficient confidence graduate to copilot-instructions.md.
+        // Uses COUNT(DISTINCT session_id) from session_injections — NOT session_count,
+        // which counts re-recordings via StoreKnowledge rather than surfacing events.
+        // File I/O is delegated entirely to Graduate() — Consolidate does none itself.
+        // TODO: graduated items have no removal path if later archived — future iteration.
+        let graduationCandidates =
+            db.Query(
+                "SELECT k.id FROM knowledge k WHERE k.status = 'active' AND k.confidence >= @confThreshold AND k.id NOT IN (SELECT item_id FROM graduations WHERE item_type = 'knowledge') AND (SELECT COUNT(DISTINCT si.session_id) FROM session_injections si WHERE si.item_id = k.id AND si.item_type = 'knowledge') >= @sessThreshold",
+                [ ("@confThreshold", box GraduationConfidenceThreshold)
+                  ("@sessThreshold", box GraduationMinDistinctSessions) ]
+            )
+        if graduationCandidates.Rows.Length > 0 then
+            let graduationResult = this.Graduate()
+            sb.AppendLine(graduationResult) |> ignore
+
         let result = sb.ToString().TrimEnd()
         if String.IsNullOrWhiteSpace(result) then "No consolidation actions needed."
         else result
@@ -175,7 +201,9 @@ type DomainService(db: ProjectMemoryDb, instructionsPath: string) =
 
         let candidates =
             db.Query(
-                "SELECT id, content, scope FROM knowledge WHERE confidence >= 0.9 AND session_count >= 10 AND id NOT IN (SELECT item_id FROM graduations WHERE item_type = 'knowledge')"
+                "SELECT k.id, k.content, k.scope FROM knowledge k WHERE k.status = 'active' AND k.confidence >= @confThreshold AND k.id NOT IN (SELECT item_id FROM graduations WHERE item_type = 'knowledge') AND (SELECT COUNT(DISTINCT si.session_id) FROM session_injections si WHERE si.item_id = k.id AND si.item_type = 'knowledge') >= @sessThreshold",
+                [ ("@confThreshold", box GraduationConfidenceThreshold)
+                  ("@sessThreshold", box GraduationMinDistinctSessions) ]
             )
 
         if candidates.Rows.Length = 0 then

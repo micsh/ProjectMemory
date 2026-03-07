@@ -220,12 +220,18 @@ type DatabaseTests() =
     member _.``Graduate writes to instructions file``() =
         let instrPath = Path.Combine(Path.GetTempPath(), $"pm-test-{Guid.NewGuid()}", ".github", "copilot-instructions.md")
         try
-            // Create knowledge with high confidence and session count
+            // Create knowledge meeting both graduation criteria: confidence >= 0.75
+            // and COUNT(DISTINCT session_id) >= 5 in session_injections.
             let id = db.StoreKnowledge("convention", "Always use strict mode", "*", "user_explicit")
             db.Execute(
-                "UPDATE knowledge SET confidence = 0.95, session_count = 12 WHERE id = @id",
+                "UPDATE knowledge SET confidence = 0.95 WHERE id = @id",
                 [ ("@id", box id) ]
             ) |> ignore
+            for i in 1 .. 5 do
+                db.Execute(
+                    "INSERT OR IGNORE INTO session_injections (session_id, item_type, item_id, injected_at) VALUES (@sid, 'knowledge', @iid, datetime('now'))",
+                    [ ("@sid", box $"grad-test-session-{i}"); ("@iid", box (string id)) ]
+                ) |> ignore
             let testSvc = DomainService(db, instrPath)
             let result = testSvc.Graduate()
             Assert.Contains("Graduated", result)
@@ -243,9 +249,14 @@ type DatabaseTests() =
         try
             let id = db.StoreKnowledge("convention", "Idempotent test rule", "*", "user_explicit")
             db.Execute(
-                "UPDATE knowledge SET confidence = 0.95, session_count = 15 WHERE id = @id",
+                "UPDATE knowledge SET confidence = 0.95 WHERE id = @id",
                 [ ("@id", box id) ]
             ) |> ignore
+            for i in 1 .. 5 do
+                db.Execute(
+                    "INSERT OR IGNORE INTO session_injections (session_id, item_type, item_id, injected_at) VALUES (@sid, 'knowledge', @iid, datetime('now'))",
+                    [ ("@sid", box $"idem-test-session-{i}"); ("@iid", box (string id)) ]
+                ) |> ignore
             let testSvc = DomainService(db, instrPath)
             testSvc.Graduate() |> ignore
             let result2 = testSvc.Graduate()
