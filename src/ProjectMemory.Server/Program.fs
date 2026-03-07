@@ -15,11 +15,20 @@ let main args =
             Path.Combine(Directory.GetCurrentDirectory(), ".project-memory", "memory.db")
         | path -> path
 
+    let instructionsPath =
+        match Environment.GetEnvironmentVariable("PROJECT_MEMORY_INSTRUCTIONS_FILE") with
+        | null | "" ->
+            Path.Combine(Directory.GetCurrentDirectory(), ".github", "copilot-instructions.md")
+        | path -> path
+
     let builder = Host.CreateApplicationBuilder(args)
     builder.Logging.ClearProviders() |> ignore
     builder.Logging.SetMinimumLevel(LogLevel.Warning) |> ignore
     builder.Logging.AddConsole(fun o -> o.LogToStandardErrorThreshold <- LogLevel.Trace) |> ignore
     builder.Services.AddSingleton<ProjectMemoryDb>(fun _ -> ProjectMemoryDb(dbPath)) |> ignore
+    builder.Services.AddSingleton<DomainService>(fun sp ->
+        let db = sp.GetRequiredService<ProjectMemoryDb>()
+        DomainService(db, instructionsPath)) |> ignore
     builder.Services
         .AddMcpServer()
         .WithStdioServerTransport()

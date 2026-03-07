@@ -26,6 +26,7 @@
     <Compile Include="Formatting.fs" />
     <Compile Include="InstructionsFile.fs" />
     <Compile Include="Database.fs" />
+    <Compile Include="DomainService.fs" />
     <Compile Include="Tools.fs" />
     <Compile Include="Resources.fs" />
     <Compile Include="Program.fs" />

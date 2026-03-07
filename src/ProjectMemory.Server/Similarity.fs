@@ -7,6 +7,8 @@ let private tokenize (s: string) =
     |> Set.ofArray
 
 let jaccard (a: string) (b: string) =
+    if isNull a || isNull b then 0.0
+    else
     let setA = tokenize a
     let setB = tokenize b
     if Set.isEmpty setA && Set.isEmpty setB then 1.0

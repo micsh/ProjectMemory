@@ -41,13 +41,13 @@ let formatContext (knowledgeRows: Map<string, obj> array) (lessonRows: Map<strin
         for category, categoryItems in grouped do
             let catHeader = $"### {categoryTitle category}"
             let catTokens = estimateTokens catHeader
-            if tokens + catTokens < maxTokens then
+            if tokens + catTokens <= maxTokens then
                 items.Add(catHeader)
                 tokens <- tokens + catTokens
                 for item in categoryItems do
                     let line = formatKnowledgeItem item
                     let lineTokens = estimateTokens line
-                    if tokens + lineTokens < maxTokens then
+                    if tokens + lineTokens <= maxTokens then
                         items.Add(line)
                         tokens <- tokens + lineTokens
                 items.Add("")
@@ -60,7 +60,7 @@ let formatContext (knowledgeRows: Map<string, obj> array) (lessonRows: Map<strin
             for lesson in lessonRows do
                 let line = formatLessonItem lesson
                 let lineTokens = estimateTokens line
-                if tokens + lineTokens < maxTokens then
+                if tokens + lineTokens <= maxTokens then
                     items.Add(line)
                     tokens <- tokens + lineTokens
             items.Add("")

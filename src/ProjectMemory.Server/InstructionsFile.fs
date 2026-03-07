@@ -20,7 +20,11 @@ let mergeIntoFile (filePath: string) (sectionContent: string) =
         Directory.CreateDirectory(dir) |> ignore
 
     let existingContent =
-        if File.Exists(filePath) then File.ReadAllText(filePath)
+        if File.Exists(filePath) then
+            // Normalize line endings so section-boundary search (\n##) works on
+            // files written on Windows with CRLF. Write-back is fine as-is;
+            // File.WriteAllText uses the platform default.
+            File.ReadAllText(filePath).Replace("\r\n", "\n")
         else ""
 
     let newContent =

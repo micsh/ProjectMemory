@@ -6,7 +6,7 @@ type QueryResult = {
 }
 
 module Schema =
-    let currentVersion = 1
+    let currentVersion = 3
 
     let versionTable = """
         CREATE TABLE IF NOT EXISTS schema_version (
@@ -63,6 +63,21 @@ module Schema =
     /// Migrations keyed by target version. Each runs when upgrading from version-1 to version.
     let migrations: (int * string) list =
         [
-            // Future migrations go here:
-            // (2, "ALTER TABLE knowledge ADD COLUMN embedding BLOB;")
+            (2, "CREATE UNIQUE INDEX IF NOT EXISTS uq_session_injections ON session_injections(session_id, item_type, item_id)")
+            // FTS5 virtual table for lessons — enables fast candidate pre-filtering
+            // in fuzzy dedup (RecordLesson) and Consolidate, bounding Jaccard comparisons
+            // to a LIMIT 50 candidate set instead of a full O(n) / O(n²) scan.
+            // The content= option keeps lessons_fts as a content table backed by lessons.
+            // Explicit triggers keep the FTS index in sync on INSERT/UPDATE/DELETE.
+            (3, """CREATE VIRTUAL TABLE IF NOT EXISTS lessons_fts USING fts5(lesson_text, content=lessons, content_rowid=id);
+CREATE TRIGGER IF NOT EXISTS lessons_fts_insert AFTER INSERT ON lessons BEGIN
+  INSERT INTO lessons_fts(rowid, lesson_text) VALUES (new.id, new.lesson_text);
+END;
+CREATE TRIGGER IF NOT EXISTS lessons_fts_update AFTER UPDATE ON lessons BEGIN
+  INSERT INTO lessons_fts(lessons_fts, rowid, lesson_text) VALUES ('delete', old.id, old.lesson_text);
+  INSERT INTO lessons_fts(rowid, lesson_text) VALUES (new.id, new.lesson_text);
+END;
+CREATE TRIGGER IF NOT EXISTS lessons_fts_delete AFTER DELETE ON lessons BEGIN
+  INSERT INTO lessons_fts(lessons_fts, rowid, lesson_text) VALUES ('delete', old.id, old.lesson_text);
+END""")
         ]

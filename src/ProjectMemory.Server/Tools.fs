@@ -9,9 +9,6 @@ open Microsoft.Data.Sqlite
 open ModelContextProtocol.Server
 
 module private Errors =
-    let validCategories = set [ "convention"; "decision"; "known_issue"; "file_note"; "preference" ]
-    let validTriggers = set [ "user_correction"; "build_failure"; "repeated_pattern"; "discovery"; "explicit" ]
-
     let friendly (ex: exn) =
         match ex with
         | :? SqliteException as se when se.SqliteErrorCode = 5 ->
@@ -21,10 +18,10 @@ module private Errors =
         | _ -> $"Error: {ex.Message}"
 
 [<McpServerToolType>]
-type KnowledgeTools(db: ProjectMemoryDb) =
+type KnowledgeTools(db: ProjectMemoryDb, domainService: DomainService) =
 
     [<McpServerTool(Name = "get_context")>]
-    [<Description("Get relevant project knowledge and lessons. Call at session start and when switching codebase areas.")>]
+    [<Description("Get relevant project knowledge and lessons. Call at session start and when switching codebase areas. Note: scope uses SQLite GLOB — * and ? wildcards only; ** is not supported for recursive matching. Use * for single-level matching (e.g., src/*.fs).")>]
     member _.GetContext
         (
             [<Optional; DefaultParameterValue(null: string)>]
@@ -38,7 +35,7 @@ type KnowledgeTools(db: ProjectMemoryDb) =
         let sessionId =
             if String.IsNullOrEmpty(sessionId) then Guid.NewGuid().ToString("N").Substring(0, 12)
             else sessionId
-        db.GetContext(scope, 20, sessionId)
+        db.GetContextAndTrack(scope, 10, sessionId)
 
     [<McpServerTool(Name = "project_query")>]
     [<Description("Run read-only SQL against the project memory database. Tables: knowledge(id,category,scope,content,confidence,source,session_count), lessons(id,lesson_text,trigger,scope,recurrence,confidence,status)")>]
@@ -83,9 +80,7 @@ type KnowledgeTools(db: ProjectMemoryDb) =
             [<Description("File glob this applies to, or '*' for project-wide")>]
             scope: string
         ) =
-        if not (Errors.validCategories.Contains(category)) then
-            $"Error: Invalid category '{category}'. Valid categories: convention, decision, known_issue, file_note, preference."
-        elif String.IsNullOrWhiteSpace(content) then
+        if String.IsNullOrWhiteSpace(content) then
             "Error: Content cannot be empty."
         else
         try
@@ -122,8 +117,6 @@ type KnowledgeTools(db: ProjectMemoryDb) =
         ) =
         if String.IsNullOrWhiteSpace(lesson) then
             "Error: Lesson text cannot be empty."
-        elif not (Errors.validTriggers.Contains(trigger)) then
-            $"Error: Invalid trigger '{trigger}'. Valid triggers: user_correction, build_failure, repeated_pattern, discovery, explicit."
         else
         try
             let scope = if String.IsNullOrEmpty(scope) then "*" else scope
@@ -131,7 +124,7 @@ type KnowledgeTools(db: ProjectMemoryDb) =
                 match trigger with
                 | "user_correction" | "explicit" -> 0.7
                 | _ -> 0.3
-            let id = db.RecordLesson(lesson, trigger, agentRole, scope, confidence, null)
+            let id = domainService.RecordLesson(lesson, trigger, agentRole, scope, confidence, null)
             $"Lesson recorded with id: {id}"
         with ex ->
             Errors.friendly ex
@@ -156,7 +149,7 @@ type KnowledgeTools(db: ProjectMemoryDb) =
     [<Description("Consolidate lessons: merge near-duplicates, promote high-recurrence lessons to knowledge, prune stale entries. Run periodically or after bulk lesson recording.")>]
     member _.Consolidate() =
         try
-            db.Consolidate()
+            domainService.Consolidate()
         with ex ->
             Errors.friendly ex
 
@@ -164,12 +157,7 @@ type KnowledgeTools(db: ProjectMemoryDb) =
     [<Description("Graduate high-confidence knowledge to copilot-instructions.md. Appends entries with confidence >= 0.9 and session_count >= 10 to an auto-managed section.")>]
     member _.Graduate() =
         try
-            let instructionsPath =
-                match Environment.GetEnvironmentVariable("PROJECT_MEMORY_INSTRUCTIONS_FILE") with
-                | null | "" ->
-                    Path.Combine(Directory.GetCurrentDirectory(), ".github", "copilot-instructions.md")
-                | path -> path
-            db.Graduate(instructionsPath)
+            domainService.Graduate()
         with ex ->
             Errors.friendly ex
 

@@ -7,6 +7,13 @@ open System.Text
 open System.Text.Json
 open Microsoft.Data.Sqlite
 
+/// Domain constants shared by the DB layer and callers.
+/// These are the single source of truth — Tools.fs delegates to the DB
+/// rather than re-declaring its own copies.
+module private Domain =
+    let validCategories = set [ "convention"; "decision"; "known_issue"; "file_note"; "preference" ]
+    let validTriggers = set [ "user_correction"; "build_failure"; "repeated_pattern"; "discovery"; "explicit" ]
+
 type ProjectMemoryDb(dbPath: string) =
     let connectionString = $"Data Source={dbPath};Mode=ReadWriteCreate"
 
@@ -46,31 +53,44 @@ type ProjectMemoryDb(dbPath: string) =
             getVer.CommandText <- "SELECT COALESCE(MAX(version), 0) FROM schema_version"
             let dbVersion = getVer.ExecuteScalar() :?> int64 |> int
 
-            // Run pending migrations
+            // Run pending migrations — each DDL + version INSERT is one atomic unit.
+            // If a crash occurs mid-migration the transaction rolls back, leaving
+            // schema_version at the previous value so the migration re-runs cleanly.
             for targetVersion, sql in Schema.migrations do
                 if targetVersion > dbVersion then
+                    use tx = conn.BeginTransaction()
                     use migrate = conn.CreateCommand()
+                    migrate.Transaction <- tx
                     migrate.CommandText <- sql
                     migrate.ExecuteNonQuery() |> ignore
                     use record = conn.CreateCommand()
+                    record.Transaction <- tx
                     record.CommandText <- "INSERT INTO schema_version (version, applied_at) VALUES (@v, @now)"
                     record.Parameters.AddWithValue("@v", targetVersion) |> ignore
                     record.Parameters.AddWithValue("@now", DateTime.UtcNow.ToString("o")) |> ignore
                     record.ExecuteNonQuery() |> ignore
+                    tx.Commit()
 
-            // Ensure current version is recorded
+            // Ensure current version is recorded (safety net for empty migrations list)
             if dbVersion < Schema.currentVersion then
+                use tx = conn.BeginTransaction()
                 use setVer = conn.CreateCommand()
+                setVer.Transaction <- tx
                 setVer.CommandText <- "INSERT INTO schema_version (version, applied_at) SELECT @v, @now WHERE NOT EXISTS (SELECT 1 FROM schema_version WHERE version = @v)"
                 setVer.Parameters.AddWithValue("@v", Schema.currentVersion) |> ignore
                 setVer.Parameters.AddWithValue("@now", DateTime.UtcNow.ToString("o")) |> ignore
                 setVer.ExecuteNonQuery() |> ignore
+                tx.Commit()
         )
 
     static member GenerateId(parts: string list) =
         let input = String.Join("|", parts)
         let hash = SHA256.HashData(Encoding.UTF8.GetBytes(input))
-        Convert.ToHexString(hash, 0, 6).ToLowerInvariant()
+        // 8 bytes = 16-char hex (64-bit space). DBs created before this change
+        // contain 12-char IDs (6 bytes); both lengths coexist in the same DB.
+        // Deduplication works correctly for each format — old entries keep their
+        // 12-char IDs and continue to be found by hash; new entries get 16-char IDs.
+        Convert.ToHexString(hash, 0, 8).ToLowerInvariant()
 
     // --- Low-level DB access ---
 
@@ -106,6 +126,8 @@ type ProjectMemoryDb(dbPath: string) =
     // --- Knowledge ---
 
     member this.StoreKnowledge(category: string, content: string, scope: string, source: string) : string =
+        if not (Domain.validCategories.Contains(category)) then
+            raise (ArgumentException($"Invalid category '{category}'. Valid categories: convention, decision, known_issue, file_note, preference."))
         let now = DateTime.UtcNow.ToString("o")
         let id = ProjectMemoryDb.GenerateId [ category; scope; content ]
         let existing =
@@ -128,44 +150,57 @@ type ProjectMemoryDb(dbPath: string) =
 
     // --- Feedback ---
 
-    member this.MarkUseful(sessionId: string, itemId: string, useful: bool) : string =
-        let affected =
-            this.Execute(
-                "UPDATE session_injections SET was_useful = @useful WHERE session_id = @sid AND item_id = @iid",
-                [ ("@useful", box (if useful then 1 else 0))
-                  ("@sid", box sessionId)
-                  ("@iid", box itemId) ]
-            )
-        if affected = 0 then
-            $"No injection record found for session={sessionId}, item={itemId}"
-        else
-            let injection =
-                this.Query(
-                    "SELECT item_type FROM session_injections WHERE session_id = @sid AND item_id = @iid LIMIT 1",
-                    [ ("@sid", box sessionId); ("@iid", box itemId) ]
-                )
-            let delta = if useful then 0.05 else -0.05
-            let now = DateTime.UtcNow.ToString("o")
-            if injection.Rows.Length > 0 then
-                match string injection.Rows.[0].["item_type"] with
+    member _.MarkUseful(sessionId: string, itemId: string, useful: bool) : string =
+        withConnection (fun conn ->
+            // (1) SELECT item_type — verify the injection record exists
+            let itemTypeOpt =
+                use selectCmd = conn.CreateCommand()
+                selectCmd.CommandText <- "SELECT item_type FROM session_injections WHERE session_id = @sid AND item_id = @iid LIMIT 1"
+                selectCmd.Parameters.AddWithValue("@sid", sessionId) |> ignore
+                selectCmd.Parameters.AddWithValue("@iid", itemId) |> ignore
+                use reader = selectCmd.ExecuteReader()
+                if reader.Read() then Some (reader.GetString(0)) else None
+
+            match itemTypeOpt with
+            | None -> $"No injection record found for session={sessionId}, item={itemId}"
+            | Some itemType ->
+                // (2) UPDATE session_injections
+                use updateInj = conn.CreateCommand()
+                updateInj.CommandText <- "UPDATE session_injections SET was_useful = @useful WHERE session_id = @sid AND item_id = @iid"
+                updateInj.Parameters.AddWithValue("@useful", if useful then 1 else 0) |> ignore
+                updateInj.Parameters.AddWithValue("@sid", sessionId) |> ignore
+                updateInj.Parameters.AddWithValue("@iid", itemId) |> ignore
+                updateInj.ExecuteNonQuery() |> ignore
+
+                // (3) UPDATE confidence on the underlying item
+                let delta = if useful then 0.05 else -0.05
+                let now = DateTime.UtcNow.ToString("o")
+                match itemType with
                 | "knowledge" ->
-                    this.Execute(
-                        "UPDATE knowledge SET confidence = MAX(0.1, MIN(1.0, confidence + @delta)), updated_at = @now WHERE id = @id",
-                        [ ("@delta", box delta); ("@now", box now); ("@id", box itemId) ]
-                    ) |> ignore
+                    use updateK = conn.CreateCommand()
+                    updateK.CommandText <- "UPDATE knowledge SET confidence = MAX(0.1, MIN(1.0, confidence + @delta)), updated_at = @now WHERE id = @id"
+                    updateK.Parameters.AddWithValue("@delta", delta) |> ignore
+                    updateK.Parameters.AddWithValue("@now", now) |> ignore
+                    updateK.Parameters.AddWithValue("@id", itemId) |> ignore
+                    updateK.ExecuteNonQuery() |> ignore
                 | "lesson" ->
-                    this.Execute(
-                        "UPDATE lessons SET confidence = MAX(0.1, MIN(1.0, confidence + @delta)), updated_at = @now WHERE id = @id",
-                        [ ("@delta", box delta); ("@now", box now); ("@id", box (int64 (int itemId))) ]
-                    ) |> ignore
+                    use updateL = conn.CreateCommand()
+                    updateL.CommandText <- "UPDATE lessons SET confidence = MAX(0.1, MIN(1.0, confidence + @delta)), updated_at = @now WHERE id = @id"
+                    updateL.Parameters.AddWithValue("@delta", delta) |> ignore
+                    updateL.Parameters.AddWithValue("@now", now) |> ignore
+                    updateL.Parameters.AddWithValue("@id", int64 itemId) |> ignore
+                    updateL.ExecuteNonQuery() |> ignore
                 | _ -> ()
-            $"Feedback recorded for {itemId}"
+                $"Feedback recorded for {itemId}"
+        )
 
     // --- Lessons ---
 
     member this.RecordLesson
         (lessonText: string, trigger: string, agentRole: string,
          scope: string, confidence: float, sourceRef: string) : int =
+        if not (Domain.validTriggers.Contains(trigger)) then
+            raise (ArgumentException($"Invalid trigger '{trigger}'. Valid triggers: user_correction, build_failure, repeated_pattern, discovery, explicit."))
         let now = DateTime.UtcNow.ToString("o")
         let scope = if String.IsNullOrEmpty(scope) then "*" else scope
         let existing =
@@ -181,10 +216,26 @@ type ProjectMemoryDb(dbPath: string) =
             ) |> ignore
             int existingId
         else
-            let activeLessons =
-                this.Query("SELECT id, lesson_text FROM lessons WHERE status = 'active'")
+            // FTS5 pre-filter: retrieve up to 50 candidate lessons whose text
+            // overlaps with the query before running the more expensive Jaccard
+            // comparison. Falls back to full scan if the query token list is empty.
+            let ftsQuery =
+                lessonText.ToLowerInvariant().Split([| ' '; '\t'; '\n'; '\r'; ','; '.'; ';'; ':' |], StringSplitOptions.RemoveEmptyEntries)
+                |> Array.map (fun t -> $"\"{t}\"")
+                |> fun tokens ->
+                    if tokens.Length = 0 then None
+                    else Some (String.concat " OR " tokens)
+            let candidates =
+                match ftsQuery with
+                | Some q ->
+                    this.Query(
+                        "SELECT l.id, l.lesson_text FROM lessons l JOIN lessons_fts f ON l.id = f.rowid WHERE f.lesson_text MATCH @q AND l.status = 'active' LIMIT 50",
+                        [ ("@q", box q) ]
+                    )
+                | None ->
+                    this.Query("SELECT id, lesson_text FROM lessons WHERE status = 'active'")
             let fuzzyMatch =
-                activeLessons.Rows
+                candidates.Rows
                 |> Array.tryFind (fun r ->
                     Similarity.jaccard lessonText (string r.["lesson_text"]) > 0.7)
             match fuzzyMatch with
@@ -208,25 +259,21 @@ type ProjectMemoryDb(dbPath: string) =
                 ) |> ignore
                 let result = this.Query("SELECT last_insert_rowid() as id")
                 let newId = result.Rows.[0].["id"] :?> int64 |> int
-                let countResult = this.Query("SELECT COUNT(*) as cnt FROM lessons WHERE status = 'active'")
-                let count = countResult.Rows.[0].["cnt"] :?> int64
-                if count > 0L && count % 10L = 0L then
-                    this.Consolidate() |> ignore
                 newId
 
     // --- Context ---
 
-    member this.GetContext(scope: string option, limit: int, ?sessionId: string, ?maxTokens: int) : string =
+    member this.GetContext(scope: string option, limit: int, ?maxTokens: int) : string =
         let knowledgeResult =
             match scope with
             | Some s ->
                 this.Query(
-                    "SELECT id, category, content, confidence, session_count, scope FROM knowledge WHERE scope = '*' OR @scope GLOB scope ORDER BY confidence DESC, session_count DESC LIMIT @limit",
+                    "SELECT id, category, content, confidence, session_count, scope FROM knowledge WHERE scope = '*' OR @scope GLOB scope ORDER BY CASE WHEN scope != '*' THEN 1 ELSE 0 END DESC, confidence DESC, updated_at DESC LIMIT @limit",
                     [ ("@scope", box s); ("@limit", box limit) ]
                 )
             | None ->
                 this.Query(
-                    "SELECT id, category, content, confidence, session_count, scope FROM knowledge ORDER BY confidence DESC, session_count DESC LIMIT @limit",
+                    "SELECT id, category, content, confidence, session_count, scope FROM knowledge ORDER BY CASE WHEN scope != '*' THEN 1 ELSE 0 END DESC, confidence DESC, updated_at DESC LIMIT @limit",
                     [ ("@limit", box limit) ]
                 )
 
@@ -234,134 +281,61 @@ type ProjectMemoryDb(dbPath: string) =
             match scope with
             | Some s ->
                 this.Query(
-                    "SELECT id, lesson_text, recurrence, confidence, trigger FROM lessons WHERE status = 'active' AND (scope = '*' OR @scope GLOB scope) ORDER BY recurrence DESC, confidence DESC LIMIT @limit",
+                    "SELECT id, lesson_text, recurrence, confidence, trigger FROM lessons WHERE status = 'active' AND (scope = '*' OR @scope GLOB scope) ORDER BY CASE WHEN scope != '*' THEN 1 ELSE 0 END DESC, confidence DESC, updated_at DESC LIMIT @limit",
                     [ ("@scope", box s); ("@limit", box limit) ]
                 )
             | None ->
                 this.Query(
-                    "SELECT id, lesson_text, recurrence, confidence, trigger FROM lessons WHERE status = 'active' ORDER BY recurrence DESC, confidence DESC LIMIT @limit",
+                    "SELECT id, lesson_text, recurrence, confidence, trigger FROM lessons WHERE status = 'active' ORDER BY CASE WHEN scope != '*' THEN 1 ELSE 0 END DESC, confidence DESC, updated_at DESC LIMIT @limit",
                     [ ("@limit", box limit) ]
                 )
 
-        match sessionId with
-        | Some sid when knowledgeResult.Rows.Length > 0 || lessonResult.Rows.Length > 0 ->
+        Formatting.formatContext knowledgeResult.Rows lessonResult.Rows (defaultArg maxTokens 2000)
+
+    member this.GetContextAndTrack(scope: string option, limit: int, sessionId: string, ?maxTokens: int) : string =
+        let knowledgeResult =
+            match scope with
+            | Some s ->
+                this.Query(
+                    "SELECT id, category, content, confidence, session_count, scope FROM knowledge WHERE scope = '*' OR @scope GLOB scope ORDER BY CASE WHEN scope != '*' THEN 1 ELSE 0 END DESC, confidence DESC, updated_at DESC LIMIT @limit",
+                    [ ("@scope", box s); ("@limit", box limit) ]
+                )
+            | None ->
+                this.Query(
+                    "SELECT id, category, content, confidence, session_count, scope FROM knowledge ORDER BY CASE WHEN scope != '*' THEN 1 ELSE 0 END DESC, confidence DESC, updated_at DESC LIMIT @limit",
+                    [ ("@limit", box limit) ]
+                )
+
+        let lessonResult =
+            match scope with
+            | Some s ->
+                this.Query(
+                    "SELECT id, lesson_text, recurrence, confidence, trigger FROM lessons WHERE status = 'active' AND (scope = '*' OR @scope GLOB scope) ORDER BY CASE WHEN scope != '*' THEN 1 ELSE 0 END DESC, confidence DESC, updated_at DESC LIMIT @limit",
+                    [ ("@scope", box s); ("@limit", box limit) ]
+                )
+            | None ->
+                this.Query(
+                    "SELECT id, lesson_text, recurrence, confidence, trigger FROM lessons WHERE status = 'active' ORDER BY CASE WHEN scope != '*' THEN 1 ELSE 0 END DESC, confidence DESC, updated_at DESC LIMIT @limit",
+                    [ ("@limit", box limit) ]
+                )
+
+        if knowledgeResult.Rows.Length > 0 || lessonResult.Rows.Length > 0 then
             let now = DateTime.UtcNow.ToString("o")
             for row in knowledgeResult.Rows do
                 this.Execute(
-                    "INSERT INTO session_injections (session_id, item_type, item_id, injected_at) VALUES (@sid, 'knowledge', @iid, @now)",
-                    [ ("@sid", box sid); ("@iid", box (string row.["id"])); ("@now", box now) ]
+                    "INSERT OR IGNORE INTO session_injections (session_id, item_type, item_id, injected_at) VALUES (@sid, 'knowledge', @iid, @now)",
+                    [ ("@sid", box sessionId); ("@iid", box (string row.["id"])); ("@now", box now) ]
                 ) |> ignore
             for row in lessonResult.Rows do
                 this.Execute(
-                    "INSERT INTO session_injections (session_id, item_type, item_id, injected_at) VALUES (@sid, 'lesson', @iid, @now)",
-                    [ ("@sid", box sid); ("@iid", box (string (row.["id"] :?> int64))); ("@now", box now) ]
+                    "INSERT OR IGNORE INTO session_injections (session_id, item_type, item_id, injected_at) VALUES (@sid, 'lesson', @iid, @now)",
+                    [ ("@sid", box sessionId); ("@iid", box (string (row.["id"] :?> int64))); ("@now", box now) ]
                 ) |> ignore
-        | _ -> ()
 
         Formatting.formatContext knowledgeResult.Rows lessonResult.Rows (defaultArg maxTokens 2000)
 
-    // --- Consolidation ---
-
-    member this.Consolidate() : string =
-        let now = DateTime.UtcNow.ToString("o")
-        let sb = StringBuilder()
-        let activeLessons =
-            this.Query("SELECT id, lesson_text, recurrence, confidence, scope, updated_at FROM lessons WHERE status = 'active'")
-
-        // Merge near-duplicates (>80% Jaccard similarity)
-        let mutable merged = Set.empty<int64>
-        let rows = activeLessons.Rows
-        for i in 0 .. rows.Length - 1 do
-            let idI = rows.[i].["id"] :?> int64
-            if not (Set.contains idI merged) then
-                for j in i + 1 .. rows.Length - 1 do
-                    let idJ = rows.[j].["id"] :?> int64
-                    if not (Set.contains idJ merged) then
-                        let textI = string rows.[i].["lesson_text"]
-                        let textJ = string rows.[j].["lesson_text"]
-                        if Similarity.jaccard textI textJ > 0.8 then
-                            let recI = rows.[i].["recurrence"] :?> int64
-                            let recJ = rows.[j].["recurrence"] :?> int64
-                            let keepId, supersededId =
-                                if recI >= recJ then idI, idJ else idJ, idI
-                            this.Execute(
-                                "UPDATE lessons SET recurrence = recurrence + @addRec, confidence = MIN(1.0, confidence + 0.1), updated_at = @now WHERE id = @id",
-                                [ ("@addRec", box (if keepId = idI then recJ else recI))
-                                  ("@now", box now); ("@id", box keepId) ]
-                            ) |> ignore
-                            this.Execute(
-                                "UPDATE lessons SET status = 'superseded', updated_at = @now WHERE id = @id",
-                                [ ("@now", box now); ("@id", box supersededId) ]
-                            ) |> ignore
-                            merged <- Set.add supersededId merged
-                            sb.AppendLine($"Merged lesson {supersededId} into {keepId}") |> ignore
-
-        // Promote high-recurrence lessons to knowledge
-        let promotable =
-            this.Query("SELECT id, lesson_text, scope FROM lessons WHERE status = 'active' AND recurrence >= 5 AND confidence >= 0.7")
-        for row in promotable.Rows do
-            let lessonId = row.["id"] :?> int64
-            let text = string row.["lesson_text"]
-            let scope = string row.["scope"]
-            this.StoreKnowledge("convention", text, scope, "learned") |> ignore
-            this.Execute(
-                "UPDATE lessons SET status = 'graduated', updated_at = @now WHERE id = @id",
-                [ ("@now", box now); ("@id", box lessonId) ]
-            ) |> ignore
-            sb.AppendLine($"Promoted lesson {lessonId} to knowledge") |> ignore
-
-        // Prune stale lessons (not updated in 30+ days, recurrence = 1)
-        let pruned =
-            this.Execute(
-                "UPDATE lessons SET status = 'superseded', updated_at = @now WHERE status = 'active' AND recurrence = 1 AND updated_at < @cutoff",
-                [ ("@now", box now); ("@cutoff", box (DateTime.UtcNow.AddDays(-30.0).ToString("o"))) ]
-            )
-        if pruned > 0 then
-            sb.AppendLine($"Pruned {pruned} stale lesson(s)") |> ignore
-
-        let result = sb.ToString().TrimEnd()
-        if String.IsNullOrWhiteSpace(result) then "No consolidation actions needed."
-        else result
-
-    // --- Graduation ---
-
-    member this.Graduate(instructionsPath: string) : string =
-        let now = DateTime.UtcNow.ToString("o")
-        let sb = StringBuilder()
-
-        let candidates =
-            this.Query(
-                "SELECT id, content, scope FROM knowledge WHERE confidence >= 0.9 AND session_count >= 10 AND id NOT IN (SELECT item_id FROM graduations WHERE item_type = 'knowledge')"
-            )
-
-        if candidates.Rows.Length = 0 then
-            "No knowledge entries ready for graduation."
-        else
-            let existingGraduated =
-                this.Query("SELECT instruction_text FROM graduations ORDER BY graduated_at")
-            let existingInstructions =
-                existingGraduated.Rows |> Array.map (fun r -> string r.["instruction_text"]) |> Array.toList
-
-            let newInstructions = ResizeArray<string>()
-            for row in candidates.Rows do
-                let knowledgeId = string row.["id"]
-                let content = string row.["content"]
-                let scope = string row.["scope"]
-                let instruction =
-                    if scope = "*" then $"- {content}"
-                    else $"- {content} (applies to: {scope})"
-                newInstructions.Add(instruction)
-                this.Execute(
-                    "INSERT INTO graduations (item_type, item_id, target_file, graduated_at, instruction_text) VALUES ('knowledge', @kid, @file, @now, @text)",
-                    [ ("@kid", box knowledgeId); ("@file", box instructionsPath)
-                      ("@now", box now); ("@text", box instruction) ]
-                ) |> ignore
-                sb.AppendLine($"Graduated knowledge {knowledgeId}: {content}") |> ignore
-
-            let allInstructions = existingInstructions @ (newInstructions |> Seq.toList)
-            let sectionContent = InstructionsFile.buildSection allInstructions
-            InstructionsFile.mergeIntoFile instructionsPath sectionContent
-            sb.ToString().TrimEnd()
+    // --- Consolidation and Graduation are owned by DomainService ---
+    // See DomainService.fs for Consolidate() and Graduate().
 
     // --- Import/Export ---
 
@@ -408,23 +382,57 @@ type ProjectMemoryDb(dbPath: string) =
         let doc = JsonDocument.Parse(json)
         let mutable knowledgeCount = 0
         let mutable lessonCount = 0
+        let mutable skippedCount = 0
 
         if doc.RootElement.TryGetProperty("knowledge") |> fst then
             for item in doc.RootElement.GetProperty("knowledge").EnumerateArray() do
                 let category = item.GetProperty("category").GetString()
                 let content = item.GetProperty("content").GetString()
-                let scope = if item.TryGetProperty("scope") |> fst then item.GetProperty("scope").GetString() else "*"
-                let source = if item.TryGetProperty("source") |> fst then item.GetProperty("source").GetString() else "imported"
-                this.StoreKnowledge(category, content, scope, source) |> ignore
-                knowledgeCount <- knowledgeCount + 1
+                if String.IsNullOrWhiteSpace(category) || String.IsNullOrWhiteSpace(content) then
+                    skippedCount <- skippedCount + 1
+                else
+                    let scope =
+                        if item.TryGetProperty("scope") |> fst then
+                            let s = item.GetProperty("scope").GetString()
+                            if String.IsNullOrWhiteSpace(s) then "*" else s
+                        else "*"
+                    let source =
+                        if item.TryGetProperty("source") |> fst then
+                            let s = item.GetProperty("source").GetString()
+                            if String.IsNullOrWhiteSpace(s) then "imported" else s
+                        else "imported"
+                    try
+                        this.StoreKnowledge(category, content, scope, source) |> ignore
+                        knowledgeCount <- knowledgeCount + 1
+                    with :? ArgumentException ->
+                        skippedCount <- skippedCount + 1
 
         if doc.RootElement.TryGetProperty("lessons") |> fst then
             for item in doc.RootElement.GetProperty("lessons").EnumerateArray() do
                 let text = item.GetProperty("lesson_text").GetString()
-                let trigger = if item.TryGetProperty("trigger") |> fst then item.GetProperty("trigger").GetString() else "explicit"
-                let scope = if item.TryGetProperty("scope") |> fst then item.GetProperty("scope").GetString() else "*"
-                let confidence = if item.TryGetProperty("confidence") |> fst then item.GetProperty("confidence").GetDouble() else 0.3
-                this.RecordLesson(text, trigger, null, scope, confidence, null) |> ignore
-                lessonCount <- lessonCount + 1
+                if String.IsNullOrWhiteSpace(text) then
+                    skippedCount <- skippedCount + 1
+                else
+                    let trigger =
+                        if item.TryGetProperty("trigger") |> fst then
+                            let s = item.GetProperty("trigger").GetString()
+                            if String.IsNullOrWhiteSpace(s) then "explicit" else s
+                        else "explicit"
+                    let scope =
+                        if item.TryGetProperty("scope") |> fst then
+                            let s = item.GetProperty("scope").GetString()
+                            if String.IsNullOrWhiteSpace(s) then "*" else s
+                        else "*"
+                    let confidence =
+                        if item.TryGetProperty("confidence") |> fst then item.GetProperty("confidence").GetDouble()
+                        else 0.3
+                    try
+                        this.RecordLesson(text, trigger, null, scope, confidence, null) |> ignore
+                        lessonCount <- lessonCount + 1
+                    with :? ArgumentException ->
+                        skippedCount <- skippedCount + 1
 
-        $"Imported {knowledgeCount} knowledge entries, {lessonCount} lessons (duplicates merged automatically)."
+        if skippedCount > 0 then
+            $"Imported {knowledgeCount} knowledge entries, {lessonCount} lessons; {skippedCount} items skipped (null/invalid fields)."
+        else
+            $"Imported {knowledgeCount} knowledge entries, {lessonCount} lessons (duplicates merged automatically)."
