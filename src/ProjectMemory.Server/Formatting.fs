@@ -15,10 +15,9 @@ let estimateTokens (text: string) = (text.Length + 3) / 4
 let private formatKnowledgeItem (item: Map<string, obj>) =
     let content = string item.["content"]
     let conf = item.["confidence"] :?> double
-    let sessions = item.["session_count"] :?> int64
     let itemScope = string item.["scope"]
     let scopeStr = if itemScope = "*" then "" else $" (scope: {itemScope})"
-    $"- [%.2f{conf}] {content}{scopeStr} — {sessions} session(s)"
+    $"- [%.2f{conf}] {content}{scopeStr}"
 
 let private formatLessonItem (lesson: Map<string, obj>) =
     let text = string lesson.["lesson_text"]

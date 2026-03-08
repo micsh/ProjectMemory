@@ -40,19 +40,17 @@ type DatabaseTests() =
     [<Fact>]
     member _.``Stores and retrieves knowledge``() =
         let id = db.StoreKnowledge("convention", "Use tabs not spaces", "*", "user_explicit")
-        let result = db.Query("SELECT content, confidence, session_count FROM knowledge WHERE id = @id", [ ("@id", box id) ])
+        let result = db.Query("SELECT content, confidence FROM knowledge WHERE id = @id", [ ("@id", box id) ])
         Assert.Equal(1, result.Rows.Length)
         Assert.Equal("Use tabs not spaces", string result.Rows.[0].["content"])
         Assert.Equal(0.5, result.Rows.[0].["confidence"] :?> double)
-        Assert.Equal(1L, result.Rows.[0].["session_count"] :?> int64)
 
     [<Fact>]
-    member _.``Deduplicates knowledge - same content bumps session count``() =
+    member _.``Deduplicates knowledge - same content bumps confidence``() =
         let id1 = db.StoreKnowledge("convention", "Always run tests", "*", "user_explicit")
         let id2 = db.StoreKnowledge("convention", "Always run tests", "*", "user_explicit")
         Assert.Equal(id1, id2)
-        let result = db.Query("SELECT session_count, confidence FROM knowledge WHERE id = @id", [ ("@id", box id1) ])
-        Assert.Equal(2L, result.Rows.[0].["session_count"] :?> int64)
+        let result = db.Query("SELECT confidence FROM knowledge WHERE id = @id", [ ("@id", box id1) ])
         Assert.True((result.Rows.[0].["confidence"] :?> double) > 0.5)
 
     [<Fact>]

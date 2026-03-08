@@ -153,13 +153,21 @@ type DomainService(db: ProjectMemoryDb, instructionsPath: string) =
         // Auto-archive items whose confidence fell below 0.2 (threshold is strict <).
         // Item at exactly 0.2 is preserved. Archived items are excluded from
         // GetContext results but remain in the DB for audit / manual recovery.
-        // Note: an item may graduate (to copilot-instructions.md) and later be archived
-        // in the DB — the instructions file has no removal mechanism (known asymmetry).
         let knowledgeArchived =
             db.Execute(
                 "UPDATE knowledge SET status = 'archived', updated_at = @now WHERE status = 'active' AND confidence < 0.2",
                 [ ("@now", box now) ]
             )
+        // Un-graduation: when Consolidate archives graduated items, Ungraduate() removes
+        // their instructions from the file. File I/O is delegated — same pattern as Graduate.
+        if knowledgeArchived > 0 then
+            let justArchived =
+                db.Query(
+                    "SELECT id FROM knowledge WHERE status = 'archived' AND updated_at = @now",
+                    [ ("@now", box now) ]
+                )
+            let archivedIds = justArchived.Rows |> Array.map (fun r -> string r.["id"]) |> Array.toList
+            this.Ungraduate(archivedIds)
         let lessonArchived =
             db.Execute(
                 "UPDATE lessons SET status = 'archived', updated_at = @now WHERE status = 'active' AND confidence < 0.2",
@@ -177,7 +185,8 @@ type DomainService(db: ProjectMemoryDb, instructionsPath: string) =
         // Uses COUNT(DISTINCT session_id) from session_injections — NOT session_count,
         // which counts re-recordings via StoreKnowledge rather than surfacing events.
         // File I/O is delegated entirely to Graduate() — Consolidate does none itself.
-        // TODO: graduated items have no removal path if later archived — future iteration.
+        // Un-graduation: when Consolidate archives graduated items, Ungraduate() removes
+        // their instructions from the file.
         let graduationCandidates =
             db.Query(
                 "SELECT k.id FROM knowledge k WHERE k.status = 'active' AND k.confidence >= @confThreshold AND k.id NOT IN (SELECT item_id FROM graduations WHERE item_type = 'knowledge') AND (SELECT COUNT(DISTINCT si.session_id) FROM session_injections si WHERE si.item_id = k.id AND si.item_type = 'knowledge') >= @sessThreshold",
@@ -241,3 +250,35 @@ type DomainService(db: ProjectMemoryDb, instructionsPath: string) =
                 sb.AppendLine($"Graduated knowledge {knowledgeId}: {content}") |> ignore
 
             sb.ToString().TrimEnd()
+
+    /// Remove graduated instructions for archived knowledge items.
+    /// Mirrors Graduate's atomicity: file write FIRST, then DB delete.
+    /// If no archived items have graduation records, returns immediately (no file I/O).
+    /// If the last graduated item is removed, the managed section becomes empty
+    /// (header + sentinel only) — the section is never deleted entirely.
+    member private this.Ungraduate(archivedKnowledgeIds: string list) =
+        if archivedKnowledgeIds.IsEmpty then () else
+
+        // Build an IN clause — IDs are internal DB strings, safe to inline
+        let idList = archivedKnowledgeIds |> List.map (fun id -> $"'{id}'") |> String.concat ","
+
+        let toRemove =
+            db.Query($"SELECT item_id, instruction_text FROM graduations WHERE item_type = 'knowledge' AND item_id IN ({idList})")
+
+        if toRemove.Rows.Length = 0 then () else    // common case: none were ever graduated
+
+        // Query the remaining records (excluding the ones about to be removed)
+        let remaining =
+            db.Query($"SELECT instruction_text FROM graduations WHERE item_type = 'knowledge' AND item_id NOT IN ({idList}) ORDER BY graduated_at")
+        let remainingInstructions =
+            remaining.Rows |> Array.map (fun r -> string r.["instruction_text"]) |> Array.toList
+
+        // Write rebuilt section FIRST — if this throws, graduation records are preserved
+        // and instructions file is unchanged (consistent state). On success, delete records.
+        let sectionContent = InstructionsFile.buildSection remainingInstructions
+        InstructionsFile.mergeIntoFile instructionsPath sectionContent
+
+        // File write succeeded — now delete the graduation records
+        db.Execute(
+            $"DELETE FROM graduations WHERE item_type = 'knowledge' AND item_id IN ({idList})"
+        ) |> ignore

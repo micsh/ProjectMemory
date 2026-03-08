@@ -16,8 +16,8 @@ ProjectMemory maintains a SQLite database of project-specific knowledge — conv
 | `project_forget` | Remove wrong or outdated knowledge |
 | `record_lesson` | Record something learned during a session |
 | `mark_useful` | Feedback on whether injected knowledge helped |
-| `consolidate` | Merge near-duplicate lessons, promote high-recurrence lessons, prune stale entries |
-| `graduate` | Promote high-confidence knowledge to copilot-instructions.md |
+| `consolidate` | Merge near-duplicate lessons, promote high-recurrence lessons, prune stale entries. Also runs confidence decay, auto-archive, and auto-graduation. Called automatically every 5th lesson when count exceeds 30. |
+| `graduate` | Promote high-confidence knowledge to copilot-instructions.md. Also runs automatically during consolidation. |
 | `export_knowledge` | Export all knowledge and lessons as JSON |
 | `import_knowledge` | Import knowledge from JSON (deduplicates automatically) |
 
@@ -146,15 +146,18 @@ Knowledge and lessons can be scoped to specific files using glob patterns:
 - `tests/**/*Integration*` — integration test files
 - `*.fsproj` — all F# project files
 
-When `get_context(scope: "src/Auth/Login.fs")` is called, it returns:
-1. All project-wide (`*`) knowledge and lessons
-2. Items scoped to patterns matching that path (e.g., `src/Auth/*`)
+When `get_context(scope: "src/Auth/Login.fs")` is called, it returns up to 10 items ranked by:
+1. Scope precision — items scoped to matching patterns rank above project-wide (`*`) items
+2. Confidence — higher confidence ranks first
+3. Recency — more recently updated items break ties
 
-## Learning Pipeline
+## Knowledge Lifecycle
 
-1. **Lesson capture** — The assistant records lessons when corrected. Fuzzy deduplication (Jaccard similarity >70%) prevents near-duplicate entries.
-2. **Consolidation** — Merges similar lessons (>80% similarity), promotes lessons with high recurrence (≥5) and confidence (≥0.7) to knowledge, prunes stale entries.
-3. **Graduation** — Knowledge entries reaching confidence ≥0.9 and session count ≥10 are appended to `.github/copilot-instructions.md` under an auto-managed section. Configurable via `PROJECT_MEMORY_INSTRUCTIONS_FILE` env var.
+1. **Lesson capture** — The assistant records lessons when corrected. Fuzzy deduplication (Jaccard similarity >70%) prevents near-duplicate entries. When the active lesson count exceeds 30, consolidation runs automatically every 5th addition.
+2. **Consolidation** — Merges similar lessons (>80% Jaccard via FTS5 pre-filtering), promotes lessons with high recurrence (≥5) and confidence (≥0.7) to knowledge, prunes stale entries (>30 days, single occurrence).
+3. **Confidence tracking** — Each time `get_context` surfaces an item, its confidence increases by 0.05 (capped per session). Items not surfaced in the last 5 sessions decay by 0.03 per consolidation. Items that drop below 0.2 confidence are auto-archived.
+4. **Graduation** — Knowledge entries reaching confidence ≥0.75 and surfaced in ≥5 distinct sessions are automatically appended to `.github/copilot-instructions.md` under an auto-managed section. Configurable via `PROJECT_MEMORY_INSTRUCTIONS_FILE` env var.
+5. **Un-graduation** — If a graduated item's confidence later decays below the archive threshold, its instruction is automatically removed from the instructions file.
 
 ## Build & Test
 
@@ -168,11 +171,12 @@ dotnet build -c Release          # For MCP / distribution
 
 ```
 ProjectMemory.Server/
-├── Schema.fs           # DDL and schema versioning
+├── Schema.fs           # DDL, migrations (v1→v5), schema versioning
 ├── Similarity.fs       # Jaccard text similarity (pure function)
 ├── Formatting.fs       # Context output formatting with token budgeting (pure function)
 ├── InstructionsFile.fs # Graduation file I/O (pure function)
-├── Database.fs         # ProjectMemoryDb class — all DB operations
+├── Database.fs         # ProjectMemoryDb class — persistence layer (read/write, no domain logic)
+├── DomainService.fs    # Domain orchestration — Consolidate, Graduate, Ungraduate, auto-triggers
 ├── Tools.fs            # MCP tool adapter layer with input validation
 ├── Resources.fs        # MCP resource endpoints (memory://context)
 └── Program.fs          # Host setup, DI, STDIO transport

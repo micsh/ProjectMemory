@@ -135,7 +135,7 @@ type ProjectMemoryDb(dbPath: string) =
             this.Query("SELECT id FROM knowledge WHERE id = @id", [ ("@id", box id) ])
         if existing.Rows.Length > 0 then
             this.Execute(
-                "UPDATE knowledge SET session_count = session_count + 1, confidence = MIN(1.0, confidence + 0.1), updated_at = @now WHERE id = @id",
+                "UPDATE knowledge SET confidence = MIN(1.0, confidence + 0.1), updated_at = @now WHERE id = @id",
                 [ ("@id", box id); ("@now", box now) ]
             ) |> ignore
         else
@@ -272,12 +272,12 @@ type ProjectMemoryDb(dbPath: string) =
             match scope with
             | Some s ->
                 this.Query(
-                    "SELECT id, category, content, confidence, session_count, scope FROM knowledge WHERE status = 'active' AND (scope = '*' OR @scope GLOB scope) ORDER BY CASE WHEN scope != '*' THEN 1 ELSE 0 END DESC, confidence DESC, updated_at DESC LIMIT @limit",
+                    "SELECT id, category, content, confidence, scope FROM knowledge WHERE status = 'active' AND (scope = '*' OR @scope GLOB scope) ORDER BY CASE WHEN scope != '*' THEN 1 ELSE 0 END DESC, confidence DESC, updated_at DESC LIMIT @limit",
                     [ ("@scope", box s); ("@limit", box limit) ]
                 )
             | None ->
                 this.Query(
-                    "SELECT id, category, content, confidence, session_count, scope FROM knowledge WHERE status = 'active' ORDER BY confidence DESC, updated_at DESC LIMIT @limit",
+                    "SELECT id, category, content, confidence, scope FROM knowledge WHERE status = 'active' ORDER BY confidence DESC, updated_at DESC LIMIT @limit",
                     [ ("@limit", box limit) ]
                 )
         let lessonResult =
@@ -301,35 +301,53 @@ type ProjectMemoryDb(dbPath: string) =
     member this.GetContextAndTrack(scope: string option, limit: int, sessionId: string, ?maxTokens: int) : string =
         let knowledgeResult, lessonResult = this.QueryContextRows(scope, limit)
 
-        if knowledgeResult.Rows.Length > 0 || lessonResult.Rows.Length > 0 then
-            let now = DateTime.UtcNow.ToString("o")
-            for row in knowledgeResult.Rows do
-                let itemId = string row.["id"]
-                // INSERT OR IGNORE returns 1 if the row is new (first injection this session),
-                // 0 if it was already tracked — use the return value as the per-session cap
-                // check, eliminating a separate SELECT COUNT(*) round-trip per item.
-                let inserted =
-                    this.Execute(
-                        "INSERT OR IGNORE INTO session_injections (session_id, item_type, item_id, injected_at) VALUES (@sid, 'knowledge', @iid, @now)",
-                        [ ("@sid", box sessionId); ("@iid", box itemId); ("@now", box now) ]
-                    )
-                if inserted > 0 then
-                    this.Execute(
-                        "UPDATE knowledge SET confidence = MIN(confidence + 0.05, 1.0), last_surfaced_at = @now, updated_at = @now WHERE id = @id",
-                        [ ("@now", box now); ("@id", box itemId) ]
-                    ) |> ignore
-            for row in lessonResult.Rows do
-                let itemId = string (row.["id"] :?> int64)
-                let inserted =
-                    this.Execute(
-                        "INSERT OR IGNORE INTO session_injections (session_id, item_type, item_id, injected_at) VALUES (@sid, 'lesson', @iid, @now)",
-                        [ ("@sid", box sessionId); ("@iid", box itemId); ("@now", box now) ]
-                    )
-                if inserted > 0 then
-                    this.Execute(
-                        "UPDATE lessons SET confidence = MIN(confidence + 0.05, 1.0), last_surfaced_at = @now, updated_at = @now WHERE id = @id",
-                        [ ("@now", box now); ("@id", box (int64 itemId)) ]
-                    ) |> ignore
+        // Tracking writes are best-effort — read results are already captured above.
+        // If FTS5 corruption (SQLITE_CORRUPT = Error 11) cascades into the tracking
+        // writes, attempt an index rebuild + one retry before giving up.
+        // Any other exception propagates normally.
+        let trackInjections () =
+            if knowledgeResult.Rows.Length > 0 || lessonResult.Rows.Length > 0 then
+                let now = DateTime.UtcNow.ToString("o")
+                for row in knowledgeResult.Rows do
+                    let itemId = string row.["id"]
+                    // INSERT OR IGNORE returns 1 if the row is new (first injection this session),
+                    // 0 if it was already tracked — use the return value as the per-session cap
+                    // check, eliminating a separate SELECT COUNT(*) round-trip per item.
+                    let inserted =
+                        this.Execute(
+                            "INSERT OR IGNORE INTO session_injections (session_id, item_type, item_id, injected_at) VALUES (@sid, 'knowledge', @iid, @now)",
+                            [ ("@sid", box sessionId); ("@iid", box itemId); ("@now", box now) ]
+                        )
+                    if inserted > 0 then
+                        this.Execute(
+                            "UPDATE knowledge SET confidence = MIN(confidence + 0.05, 1.0), last_surfaced_at = @now, updated_at = @now WHERE id = @id",
+                            [ ("@now", box now); ("@id", box itemId) ]
+                        ) |> ignore
+                for row in lessonResult.Rows do
+                    let itemId = string (row.["id"] :?> int64)
+                    let inserted =
+                        this.Execute(
+                            "INSERT OR IGNORE INTO session_injections (session_id, item_type, item_id, injected_at) VALUES (@sid, 'lesson', @iid, @now)",
+                            [ ("@sid", box sessionId); ("@iid", box itemId); ("@now", box now) ]
+                        )
+                    if inserted > 0 then
+                        this.Execute(
+                            "UPDATE lessons SET confidence = MIN(confidence + 0.05, 1.0), last_surfaced_at = @now, updated_at = @now WHERE id = @id",
+                            [ ("@now", box now); ("@id", box (int64 itemId)) ]
+                        ) |> ignore
+
+        try
+            trackInjections()
+        with
+        | :? SqliteException as ex when ex.SqliteErrorCode = 11 ->
+            // SQLITE_CORRUPT: FTS5 index corruption cascaded into tracking writes.
+            // Attempt index rebuild + one retry. If that also fails, log and degrade
+            // gracefully — the read results are already fetched and will be returned.
+            try
+                this.Execute("INSERT INTO lessons_fts(lessons_fts) VALUES('rebuild')") |> ignore
+                trackInjections()
+            with _ ->
+                eprintfn "[ProjectMemory] Warning: FTS5 rebuild failed — returning context without tracking. Error: %s" ex.Message
 
         Formatting.formatContext knowledgeResult.Rows lessonResult.Rows (defaultArg maxTokens 2000)
 
@@ -340,7 +358,7 @@ type ProjectMemoryDb(dbPath: string) =
 
     member this.Export() : string =
         let knowledge =
-            this.Query("SELECT id, category, scope, content, confidence, source, session_count FROM knowledge ORDER BY category, content")
+            this.Query("SELECT id, category, scope, content, confidence, source FROM knowledge ORDER BY category, content")
         let lessons =
             this.Query("SELECT lesson_text, trigger, scope, recurrence, confidence, status FROM lessons ORDER BY status, recurrence DESC")
 
@@ -357,7 +375,6 @@ type ProjectMemoryDb(dbPath: string) =
             writer.WriteString("content", string row.["content"])
             writer.WriteNumber("confidence", row.["confidence"] :?> double)
             writer.WriteString("source", string row.["source"])
-            writer.WriteNumber("session_count", row.["session_count"] :?> int64)
             writer.WriteEndObject()
         writer.WriteEndArray()
 

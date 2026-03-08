@@ -6,7 +6,7 @@ type QueryResult = {
 }
 
 module Schema =
-    let currentVersion = 4
+    let currentVersion = 5
 
     let versionTable = """
         CREATE TABLE IF NOT EXISTS schema_version (
@@ -84,11 +84,18 @@ module Schema =
             // v3: FTS5 virtual table for lessons — fast candidate pre-filtering in fuzzy
             // dedup (RecordLesson) and Consolidate. content= keeps it backed by lessons.
             // Explicit triggers keep the index in sync on INSERT/UPDATE/DELETE.
-            (3, [ ftsCreate; ftsInsertTrigger; ftsUpdateTrigger; ftsDeleteTrigger ])
+            // The rebuild command at the end ensures existing rows are indexed for DBs
+            // that had lessons before migrating to v3. No-op on empty tables.
+            (3, [ ftsCreate; ftsInsertTrigger; ftsUpdateTrigger; ftsDeleteTrigger; "INSERT INTO lessons_fts(lessons_fts) VALUES('rebuild')" ])
             // v4: confidence lifecycle columns. last_surfaced_at tracks when an item was
             // last returned by GetContextAndTrack (used by decay in Consolidate).
             // knowledge.status mirrors lessons.status — enables archiving without deletion.
             (4, [ "ALTER TABLE knowledge ADD COLUMN last_surfaced_at TEXT"
                   "ALTER TABLE lessons ADD COLUMN last_surfaced_at TEXT"
                   "ALTER TABLE knowledge ADD COLUMN status TEXT NOT NULL DEFAULT 'active'" ])
+            // v5: drop vestigial session_count column. All session-based criteria now use
+            // COUNT(DISTINCT session_id) from session_injections. Fresh DBs run DDL (which
+            // includes session_count) then this migration drops it — both paths produce the
+            // same final schema.
+            (5, [ "ALTER TABLE knowledge DROP COLUMN session_count" ])
         ]
