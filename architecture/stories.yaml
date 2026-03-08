@@ -1,0 +1,67 @@
+# Cross-cutting flows connecting modules across the system.
+
+stories:
+
+  - id: get-context-tool
+    description: |
+      Agent calls get_context tool with optional scope + sessionId.
+      Tool validates input, calls GetContext (which also writes session_injections),
+      returns formatted context string within token budget.
+    flow:
+      - projectmemory.server/tools
+      - projectmemory.server/database
+      - projectmemory.server/formatting
+
+  - id: get-context-resource
+    description: |
+      MCP client attaches memory://context resource. Pure read — no session tracking.
+      GetContext called without sessionId; no session_injections written.
+    flow:
+      - projectmemory.server/resources
+      - projectmemory.server/database
+      - projectmemory.server/formatting
+
+  - id: record-lesson
+    description: |
+      Agent calls record_lesson. Tool validates trigger/scope, calls DomainService.RecordLesson
+      (wraps db.RecordLesson + auto-consolidation trigger when count > 30 every 5th).
+      NOTE: currently wired to db.RecordLesson directly — DomainService wiring pending (C2).
+    flow:
+      - projectmemory.server/tools
+      - projectmemory.server/domain-service
+      - projectmemory.server/database
+      - projectmemory.server/similarity
+
+  - id: consolidate
+    description: |
+      Agent calls consolidate. DomainService.Consolidate: FTS5 pre-filter + Jaccard merge,
+      lesson promotion, stale pruning, confidence decay, auto-archive, auto-graduation.
+      Graduation writes to copilot-instructions.md via InstructionsFile.
+      NOTE: currently wired to db.Consolidate (legacy) — DomainService wiring pending (C2).
+    flow:
+      - projectmemory.server/tools
+      - projectmemory.server/domain-service
+      - projectmemory.server/database
+      - projectmemory.server/similarity
+      - projectmemory.server/instructions-file
+
+  - id: graduate
+    description: |
+      Agent calls graduate. DomainService.Graduate: collect candidates, write file FIRST,
+      then insert DB graduation records on success (atomicity pattern — file write before DB).
+      NOTE: currently wired to db.Graduate (legacy path, wrong write order) — pending C2 fix.
+    flow:
+      - projectmemory.server/tools
+      - projectmemory.server/domain-service
+      - projectmemory.server/database
+      - projectmemory.server/instructions-file
+
+  - id: import-export
+    description: |
+      Agent calls import_knowledge / export_knowledge. Database.Import/Export handles
+      JSON serialisation and batch upsert. Import triggers RecordLesson per lesson item
+      (fuzzy dedup via Similarity).
+    flow:
+      - projectmemory.server/tools
+      - projectmemory.server/database
+      - projectmemory.server/similarity

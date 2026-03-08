@@ -1,0 +1,82 @@
+guidance: |
+  Before making code changes, run `arch owns <concept>` to find the owning module.
+  After changes, update ownership and dependencies if they changed.
+  Run `arch validate` after editing this file.
+  Check stories.yaml if your change crosses multiple modules.
+
+system:
+  name: ProjectMemory
+  description: |
+    MCP server that provides a self-sustaining knowledge lifecycle for AI coding assistants.
+    Stores project knowledge and lessons in SQLite, surfaces them via MCP tools/resources,
+    and manages confidence, consolidation, graduation to copilot-instructions.md.
+
+containers:
+  - id: projectmemory.server
+    name: ProjectMemory.Server
+    path: src/ProjectMemory.Server
+    description: |
+      Single-process MCP server. Exposes tools (record, query, consolidate, graduate)
+      and resources (context feeds) to MCP clients. Owns all persistence, domain logic,
+      and file-write operations.
+    details: architecture/projectmemory.server.yaml
+
+rules:
+  - id: utilities-have-no-deps
+    type: no_dependency
+    from: projectmemory.server/similarity
+    to: [projectmemory.server/database, projectmemory.server/domain-service,
+         projectmemory.server/tools, projectmemory.server/resources,
+         projectmemory.server/formatting, projectmemory.server/instructions-file,
+         projectmemory.server/schema]
+    reason: "Similarity is a pure stateless computation — no I/O, no DB, no imports from this project."
+
+  - id: formatting-has-no-deps
+    type: no_dependency
+    from: projectmemory.server/formatting
+    to: [projectmemory.server/database, projectmemory.server/domain-service,
+         projectmemory.server/tools, projectmemory.server/resources,
+         projectmemory.server/instructions-file, projectmemory.server/schema]
+    reason: "Formatting is a pure rendering utility — stateless, no I/O, no DB."
+
+  - id: instructions-file-has-no-deps
+    type: no_dependency
+    from: projectmemory.server/instructions-file
+    to: [projectmemory.server/database, projectmemory.server/domain-service,
+         projectmemory.server/tools, projectmemory.server/resources,
+         projectmemory.server/formatting, projectmemory.server/schema]
+    reason: "InstructionsFile is a pure file-I/O utility — no DB, no domain knowledge."
+
+  - id: schema-has-no-deps
+    type: no_dependency
+    from: projectmemory.server/schema
+    to: [projectmemory.server/database, projectmemory.server/domain-service,
+         projectmemory.server/tools, projectmemory.server/resources,
+         projectmemory.server/formatting, projectmemory.server/similarity,
+         projectmemory.server/instructions-file]
+    reason: "Schema is pure DDL data — no runtime dependencies."
+
+  - id: database-not-above-itself
+    type: no_dependency
+    from: projectmemory.server/database
+    to: [projectmemory.server/domain-service, projectmemory.server/tools,
+         projectmemory.server/resources]
+    reason: "Database is the lowest layer — must not depend on the layers above it."
+
+  - id: domain-service-not-above-itself
+    type: no_dependency
+    from: projectmemory.server/domain-service
+    to: [projectmemory.server/tools, projectmemory.server/resources]
+    reason: "DomainService sits below the adapter layer — must not depend on MCP adapters."
+
+  - id: tools-resources-independent
+    type: no_dependency
+    from: projectmemory.server/tools
+    to: [projectmemory.server/resources]
+    reason: "Tools and Resources are sibling MCP adapters — must not couple to each other."
+
+  - id: resources-tools-independent
+    type: no_dependency
+    from: projectmemory.server/resources
+    to: [projectmemory.server/tools]
+    reason: "Resources and Tools are sibling MCP adapters — must not couple to each other."

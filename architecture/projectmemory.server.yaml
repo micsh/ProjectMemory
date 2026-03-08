@@ -1,0 +1,161 @@
+# projectmemory.server — MCP server container
+# Source: src/ProjectMemory.Server
+#
+# Layer model (dependency flows downward only):
+#
+#   program          — composition root
+#   tools | resources — MCP adapter layer (siblings, no coupling)
+#   domain-service   — domain orchestration
+#   database         — persistence
+#   schema | formatting | similarity | instructions-file  — leaf utilities
+
+modules:
+
+  - id: schema
+    file: Schema.fs
+    owns:
+      - schema-definition
+      - migration-list
+      - database-version
+    boundary: |
+      Pure DDL data — SQL strings and the migration list only.
+      No runtime logic, no imports from any other module in this project.
+      Adding a migration = adding one tuple to the migrations list and bumping currentVersion.
+    depends_on: []
+
+  - id: similarity
+    file: Similarity.fs
+    owns:
+      - jaccard-similarity
+      - text-tokenization
+    boundary: |
+      Pure stateless computation. No I/O, no DB, no project imports.
+      Single entry point: Similarity.jaccard — null-safe, returns float in [0.0, 1.0].
+    depends_on: []
+
+  - id: formatting
+    file: Formatting.fs
+    owns:
+      - context-formatting
+      - token-budget-enforcement
+      - knowledge-item-rendering
+      - lesson-item-rendering
+    boundary: |
+      Pure rendering utility. Stateless functions only.
+      Receives row data as Map arrays — never queries DB directly.
+      Must not import database, domain-service, tools, or resources.
+    depends_on: []
+
+  - id: instructions-file
+    file: InstructionsFile.fs
+    owns:
+      - copilot-instructions-management
+      - managed-section-merge
+      - managed-section-build
+    boundary: |
+      File I/O for copilot-instructions.md only.
+      Knows nothing about knowledge IDs, confidence, or DB schema.
+      Called exclusively by domain-service (Graduate). No DB access.
+      CRLF normalisation is applied on read to keep section-boundary search correct on Windows.
+    depends_on: []
+
+  - id: database
+    file: Database.fs
+    owns:
+      - persistence
+      - knowledge-crud
+      - lesson-crud
+      - feedback-tracking
+      - context-query
+      - session-injection-tracking
+      - id-generation
+      - schema-migration-execution
+      - import-export
+      - domain-validation
+    boundary: |
+      Persistence and CRUD only. Owns all SQL execution and schema bootstrapping.
+      GetContext is a pure read — no session_injections writes.
+      GetContextAndTrack writes session_injections as a tracking side-effect (this is its contract).
+      Does NOT own Consolidate or Graduate — those live in DomainService.
+      Owns domain validation (validCategories, validTriggers) in module private Domain —
+      StoreKnowledge and RecordLesson raise ArgumentException on invalid inputs; callers
+      (Tools.fs) surface these via Errors.friendly.
+      May call Similarity for inline fuzzy dedup inside RecordLesson (bounded O(n) scan).
+      May call Formatting to render context results.
+    depends_on:
+      - projectmemory.server/schema
+      - projectmemory.server/similarity
+      - projectmemory.server/formatting
+
+  - id: domain-service
+    file: DomainService.fs
+    owns:
+      - consolidation
+      - graduation
+      - auto-consolidation-trigger
+      - confidence-decay
+      - auto-archive
+      - auto-graduation
+      - fts5-pre-filtering
+      - graduation-threshold-constants
+    boundary: |
+      Domain orchestration layer. Owns all multi-step operations that span persistence
+      and file I/O. Delegates all SQL to ProjectMemoryDb; delegates all file writes to
+      InstructionsFile. Consolidate and Graduate live here — not in Database.
+      The adapter layer (Tools.fs) calls DomainService for Consolidate, Graduate, and
+      RecordLesson. Do not move SQL execution or file I/O into this layer directly.
+    depends_on:
+      - projectmemory.server/database
+      - projectmemory.server/similarity
+      - projectmemory.server/instructions-file
+
+  - id: tools
+    file: Tools.fs
+    owns:
+      - mcp-tool-registration
+      - input-validation
+      - error-translation
+      - tool-routing
+    boundary: |
+      MCP adapter only. Validates inputs, translates exceptions to user-readable strings,
+      and routes calls to the domain/persistence layer. No domain logic here.
+      Delegates Consolidate, Graduate, and RecordLesson to DomainService.
+      Delegates GetContext, MarkUseful, StoreKnowledge, ForgetKnowledge, Import, Export
+      directly to ProjectMemoryDb (these are not domain operations).
+      Validation (category, trigger) is enforced by Database.fs (module private Domain)
+      before any DB write; Tools.fs receives ArgumentException and surfaces it via Errors.friendly.
+    depends_on:
+      - projectmemory.server/database
+      - projectmemory.server/domain-service
+
+  - id: resources
+    file: Resources.fs
+    owns:
+      - mcp-resource-registration
+      - pure-read-context-resource
+      - scoped-context-resource
+    boundary: |
+      MCP resource adapter. Pure reads only — calls GetContext without a sessionId
+      so no session_injections are written. Must not write any DB state.
+      Must not depend on Tools or DomainService.
+    depends_on:
+      - projectmemory.server/database
+
+  - id: program
+    file: Program.fs
+    owns:
+      - composition-root
+      - dependency-injection
+      - host-configuration
+      - environment-variable-resolution
+      - startup
+    boundary: |
+      Entry point and DI wiring only. Resolves environment variables (PROJECT_MEMORY_DB,
+      PROJECT_MEMORY_INSTRUCTIONS_FILE) and registers singletons. No business logic.
+      Registers ProjectMemoryDb and DomainService as singletons; KnowledgeTools receives
+      both via constructor injection.
+    depends_on:
+      - projectmemory.server/database
+      - projectmemory.server/domain-service
+      - projectmemory.server/tools
+      - projectmemory.server/resources
